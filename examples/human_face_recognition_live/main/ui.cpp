@@ -9,23 +9,25 @@
 static const char *TAG = "ui";
 
 static lv_obj_t *s_canvas = nullptr;
-static lv_obj_t *s_status_label = nullptr;
-static lv_obj_t *s_enroll_label = nullptr;
-static lv_obj_t *s_stats_label = nullptr;
-static lv_obj_t *s_warn_label = nullptr;  // glare / spoof warning banner (top-center)
-static lv_obj_t *s_range_lbl = nullptr;   // caption of the RANGE toggle button
-static lv_obj_t *s_reco_lbl = nullptr;    // caption of the RECO toggle button
-static lv_obj_t *s_spoof_lbl = nullptr;   // caption of the SPOOF toggle button
+static lv_obj_t *s_status_label = nullptr; // headline result (top-left)
+static lv_obj_t *s_enroll_label = nullptr; // action feedback (above buttons)
+static lv_obj_t *s_stats_label = nullptr;  // R&D dashboard (right)
+static lv_obj_t *s_warn_label = nullptr;   // glare / spoof banner (top-center)
+static lv_obj_t *s_range_lbl = nullptr;    // RANGE button caption
+static lv_obj_t *s_det_lbl = nullptr;      // DET (detector model) button caption
+static lv_obj_t *s_rec_lbl = nullptr;      // REC (recognizer model) button caption
+static lv_obj_t *s_spoof_lbl = nullptr;    // SPOOF (mode) button caption
 
-static void style_text_panel(lv_obj_t *label)
+static void style_text_panel(lv_obj_t *label, lv_opa_t bg_opa)
 {
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
     lv_obj_set_style_bg_color(label, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(label, LV_OPA_50, 0);
+    lv_obj_set_style_bg_opa(label, bg_opa, 0);
     lv_obj_set_style_pad_all(label, 6, 0);
     lv_obj_set_style_radius(label, 4, 0);
 }
 
+/* -------- button callbacks (run in the LVGL task) -------- */
 static void enroll_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -45,36 +47,52 @@ static void range_btn_cb(lv_event_t *e)
     (void)e;
     face_processor_cycle_range();
     char b[24];
-    snprintf(b, sizeof(b), "RANGE:%s", face_processor_range_name());
+    snprintf(b, sizeof(b), "RNG:%s", face_processor_range_name());
     if (s_range_lbl) {
         lv_label_set_text(s_range_lbl, b);
     }
 }
 
-static void reco_btn_cb(lv_event_t *e)
+static void det_btn_cb(lv_event_t *e)
 {
     (void)e;
-    int on = face_processor_toggle_reco();
-    if (s_reco_lbl) {
-        lv_label_set_text(s_reco_lbl, on ? "RECO:On" : "RECO:Off");
+    const char *n = face_processor_cycle_det_model(); // applied by AI task shortly
+    char b[24];
+    snprintf(b, sizeof(b), "DET:%s", n);
+    if (s_det_lbl) {
+        lv_label_set_text(s_det_lbl, b);
+    }
+}
+
+static void rec_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *n = face_processor_cycle_feat_model();
+    char b[24];
+    snprintf(b, sizeof(b), "REC:%s", n);
+    if (s_rec_lbl) {
+        lv_label_set_text(s_rec_lbl, b);
     }
 }
 
 static void spoof_btn_cb(lv_event_t *e)
 {
     (void)e;
-    int on = face_processor_toggle_spoof();
+    const char *n = face_processor_cycle_spoof();
+    char b[24];
+    snprintf(b, sizeof(b), "SPF:%s", n);
     if (s_spoof_lbl) {
-        lv_label_set_text(s_spoof_lbl, on ? "SPOOF:On" : "SPOOF:Off");
+        lv_label_set_text(s_spoof_lbl, b);
     }
 }
 
-// Create a bottom-row touch button; returns the inner LABEL so toggle captions can be updated.
-static lv_obj_t *make_button(lv_obj_t *parent, const char *caption, int x_ofs, lv_event_cb_t cb)
+// Create a touch button; returns the inner LABEL so dynamic captions can be updated.
+static lv_obj_t *make_button(lv_obj_t *parent, const char *caption, lv_align_t align, int x, int y,
+                             lv_event_cb_t cb)
 {
     lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, 184, 56);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, x_ofs, -10);
+    lv_obj_set_size(btn, 200, 54);
+    lv_obj_align(btn, align, x, y);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *lbl = lv_label_create(btn);
@@ -84,62 +102,82 @@ static lv_obj_t *make_button(lv_obj_t *parent, const char *caption, int x_ofs, l
     return lbl;
 }
 
-/* Periodically refresh the live stats panel. Runs in the LVGL task with the port
- * lock held (lv_timer callbacks always do), so touching widgets here is safe. */
+/* Refresh the R&D dashboard + warning banner (LVGL task, port lock held). */
 static void stats_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     if (!s_stats_label) {
         return;
     }
-    pipeline_stats_t s;
+    // Static: this callback runs only on the LVGL task and is non-reentrant. Keeps ~1.5 KB
+    // of buffers off that task's stack (a stack overflow there would boot-loop on first refresh).
+    static pipeline_stats_t s;
     face_processor_get_stats(&s);
 
-    const char *rec = (s.rec_state == 1) ? "run" : (s.rec_state == 2) ? "wait" : "off";
-    const char *live = (s.spoof_state == 2) ? " SPOOF?" : (s.spoof_state == 1) ? " live" : "";
-    unsigned int_free = s.free_internal / 1024;
-    unsigned int_used = (s.total_internal - s.free_internal) / 1024;
-    unsigned int_tot = s.total_internal / 1024;
-    unsigned int_lg = s.largest_internal / 1024;
-    unsigned int_min = s.min_free_internal / 1024;
-    unsigned ps_free = s.free_psram / 1024;
-    unsigned ps_used = (s.total_psram - s.free_psram) / 1024;
-    unsigned ps_tot = s.total_psram / 1024;
-    unsigned st_used = (s.store_total - s.store_free) / 1024;
-    unsigned st_tot = s.store_total / 1024;
+    float cap_hz = s.cap_ms > 0.1f ? 1000.0f / s.cap_ms : 0.0f;
+    float det_hz = s.det_ms > 0.1f ? 1000.0f / s.det_ms : 0.0f;
+    float rec_hz = s.rec_ms > 0.1f ? 1000.0f / s.rec_ms : 0.0f;
+    unsigned int_free = s.free_internal / 1024, int_tot = s.total_internal / 1024;
+    int int_pct = s.total_internal ? (int)(100ULL * (s.total_internal - s.free_internal) / s.total_internal) : 0;
+    float ps_free = s.free_psram / 1048576.0f, ps_tot = s.total_psram / 1048576.0f;
+    int ps_pct = s.total_psram ? (int)(100ULL * (s.total_psram - s.free_psram) / s.total_psram) : 0;
+    unsigned st_used = (s.store_total - s.store_free) / 1024, st_tot = s.store_total / 1024;
 
-    char buf[768];
+    // Colour-coded fragments (label has recolor enabled): green ok, yellow caution, red alert.
+    static char c0[28], c1[28], recln[72], livln[48], lightln[40];
+    snprintf(c0, sizeof(c0), "#%s %.0f%%#", s.load_core0 > 90 ? "ff5555" : "66ff66", s.load_core0);
+    snprintf(c1, sizeof(c1), "#%s %.0f%%#", s.load_core1 > 90 ? "ff5555" : "66ff66", s.load_core1);
+    if (s.rec_state == 3) {
+        snprintf(recln, sizeof(recln), "#ffcc33 N/A - ESPDet (no landmarks)#");
+    } else {
+        snprintf(recln, sizeof(recln), "%.0f ms (%.1f/s) [%s]", s.rec_ms, rec_hz,
+                 s.rec_state == 1 ? "run" : s.rec_state == 2 ? "wait" : "idle");
+    }
+    if (s.spoof_mode == 0) {
+        snprintf(livln, sizeof(livln), "off");
+    } else if (s.spoof_state == 2) {
+        snprintf(livln, sizeof(livln), "#ff5555 SPOOF? (%d)#", s.live_score);
+    } else {
+        snprintf(livln, sizeof(livln), "#66ff66 live (%d)#", s.live_score);
+    }
+    snprintf(lightln, sizeof(lightln), "%s",
+             s.glare ? "#ff5555 GLARE#" : (s.bright ? "#ffcc33 BRIGHT#" : "#66ff66 OK#"));
+
+    static char buf[1100];
     snprintf(buf, sizeof(buf),
-             "FPS %2.0f    RNG %s\n"
-             "Cap%4.1f Cpy%4.1f Drw%4.1f\n"
-             "Det%4.1f%s Dsp%4.1f ms\n"
-             "Rec%5.1f ms [%s]\n"
-             "Faces %d  DB %d%s\n"
-             "- MODELS -\n"
-             "D %s %dx%d\n"
-             "R %s  feat%d\n"
-             "- MEM KB free/used/tot -\n"
-             "Int %u/%u/%u\n"
-             " lgst %u  min %u\n"
-             "PSR %u/%u/%u\n"
-             "- STORE (face DB) -\n"
-             "%d faces, cap ~%d\n"
+             "#22ddff PERFORMANCE#\n"
+             "Pipeline  %.0f FPS\n"
+             "Capture   %.0f ms (%.0f/s)\n"
+             "Copy ROI  %.1f ms\n"
+             "Detect    %.0f ms (%.0f/s)\n"
+             "Recognize %s\n"
+             "Overlay   %.1f ms\n"
+             "Display   %.0f ms\n"
+             "Load  C0 %s  C1 %s\n"
+             "#22ddff MODELS#  (%s)\n"
+             "Detect %s  %dx%d\n"
+             "Recog  %s  f%d\n"
+             "  %.1fM  %.2fG  TAR %.1f%%\n"
+             "Spoof  %s   %s\n"
+             "#22ddff MEMORY#\n"
+             "Int   %u/%u KB (%d%%)\n"
+             "PSRAM %.1f/%.1f MB (%d%%)\n"
+             "#22ddff STORAGE (face DB)#\n"
+             "Faces %d / ~%d max\n"
              "%u/%u KB used\n"
-             "- LIGHT -\n"
-             "luma %3.0f  sat %2.0f%%%s\n"
-             "RECO:%s  SPOOF:%s",
-             s.fps, face_processor_range_name(), s.cap_ms, s.copy_ms, s.draw_ms, s.det_ms,
-             s.det_busy ? "*" : " ", s.disp_ms, s.rec_ms, rec, s.faces, s.db_count, live, s.det_model,
-             s.model_in_w, s.model_in_h, s.reco_model, s.feat_len, int_free, int_used, int_tot, int_lg,
-             int_min, ps_free, ps_used, ps_tot, s.db_count, s.db_capacity, st_used, st_tot, s.mean_luma,
-             s.sat_frac * 100.0f, s.glare ? " GLARE" : (s.bright ? " BRIGHT" : ""), s.reco_on ? "On" : "Off",
-             s.spoof_on ? "On" : "Off");
+             "#22ddff LIGHT#\n"
+             "luma %.0f  sat %.0f%%  %s",
+             s.fps, s.cap_ms, cap_hz, s.copy_ms, s.det_ms, det_hz, recln, s.draw_ms, s.disp_ms, c0, c1,
+             s.model_loc, s.det_model, s.model_in_w, s.model_in_h, s.reco_model, s.feat_len, s.feat_params,
+             s.feat_gflops, s.feat_tar, face_processor_spoof_name(), livln, int_free, int_tot, int_pct,
+             ps_free, ps_tot, ps_pct, s.db_count, s.db_capacity, st_used, st_tot, s.mean_luma,
+             s.sat_frac * 100.0f, lightln);
     lv_label_set_text(s_stats_label, buf);
 
     // Warning banner: strongest condition wins (spoof > glare > bright).
     if (s_warn_label) {
         char w[96];
-        if (s.spoof_state == 2) {
+        if (s.spoof_mode != 0 && s.spoof_state == 2) {
             snprintf(w, sizeof(w), LV_SYMBOL_WARNING " SPOOF SUSPECTED  (liveness %d)", s.live_score);
         } else if (s.glare) {
             snprintf(w, sizeof(w), LV_SYMBOL_WARNING " STRONG GLARE - reduce light / reposition");
@@ -164,24 +202,24 @@ void ui_init(void)
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
-    // Full-screen canvas that displays the camera frames (created first => bottom layer).
+    // Full-screen camera canvas (created first => bottom layer).
     s_canvas = lv_canvas_create(scr);
     lv_obj_set_size(s_canvas, BSP_LCD_H_RES, BSP_LCD_V_RES);
     lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, 0);
 
-    // Status bar (top-left).
+    // Headline result (top-left).
     s_status_label = lv_label_create(scr);
-    style_text_panel(s_status_label);
-    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_20, 0);
+    style_text_panel(s_status_label, LV_OPA_50);
+    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_24, 0);
     lv_label_set_text(s_status_label, "Starting camera...");
     lv_obj_align(s_status_label, LV_ALIGN_TOP_LEFT, 8, 8);
 
-    // Enrollment status line (just above the buttons).
+    // Action feedback line (just above the buttons, bottom-left).
     s_enroll_label = lv_label_create(scr);
-    style_text_panel(s_enroll_label);
-    lv_obj_set_style_text_font(s_enroll_label, &lv_font_montserrat_20, 0);
+    style_text_panel(s_enroll_label, LV_OPA_50);
+    lv_obj_set_style_text_font(s_enroll_label, &lv_font_montserrat_16, 0);
     lv_label_set_text(s_enroll_label, "Tap ENROLL to register the centered face");
-    lv_obj_align(s_enroll_label, LV_ALIGN_BOTTOM_MID, 0, -76);
+    lv_obj_align(s_enroll_label, LV_ALIGN_BOTTOM_LEFT, 12, -134);
 
     // Warning banner (top-center): glare / over-exposure / suspected spoof. Hidden when clear.
     s_warn_label = lv_label_create(scr);
@@ -195,23 +233,28 @@ void ui_init(void)
     lv_obj_align(s_warn_label, LV_ALIGN_TOP_MID, 0, 6);
     lv_obj_add_flag(s_warn_label, LV_OBJ_FLAG_HIDDEN);
 
-    // Live stats panel (top-right): per-stage timing, memory, model/ROI info.
+    // R&D dashboard (top-right): per-stage perf, models+metrics, memory, storage, light.
     s_stats_label = lv_label_create(scr);
-    style_text_panel(s_stats_label);
-    lv_obj_set_style_text_font(s_stats_label, &lv_font_montserrat_14, 0);
+    style_text_panel(s_stats_label, LV_OPA_70);
+    lv_label_set_recolor(s_stats_label, true);
+    lv_obj_set_style_text_font(s_stats_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_align(s_stats_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_label_set_text(s_stats_label, "stats...");
-    lv_obj_align(s_stats_label, LV_ALIGN_TOP_RIGHT, -8, 8);
-    lv_timer_create(stats_timer_cb, 300, nullptr); // refresh ~3 Hz
+    lv_label_set_text(s_stats_label, "dashboard...");
+    lv_obj_align(s_stats_label, LV_ALIGN_TOP_RIGHT, -6, 6);
+    lv_timer_create(stats_timer_cb, 300, nullptr); // ~3 Hz
 
-    // Touch buttons: 5 across the bottom (pitch 198 px, centred).
-    char rb[24];
-    snprintf(rb, sizeof(rb), "RANGE:%s", face_processor_range_name());
-    make_button(scr, "ENROLL", -396, enroll_btn_cb);
-    make_button(scr, "CLEAR DB", -198, clear_btn_cb);
-    s_range_lbl = make_button(scr, rb, 0, range_btn_cb);
-    s_reco_lbl = make_button(scr, "RECO:On", 198, reco_btn_cb);
-    s_spoof_lbl = make_button(scr, "SPOOF:Off", 396, spoof_btn_cb);
+    // Buttons: 2 rows x 3, bottom-left (clear of the right-hand dashboard).
+    char b[24];
+    make_button(scr, "ENROLL", LV_ALIGN_BOTTOM_LEFT, 12, -72, enroll_btn_cb);
+    make_button(scr, "CLEAR DB", LV_ALIGN_BOTTOM_LEFT, 224, -72, clear_btn_cb);
+    snprintf(b, sizeof(b), "RNG:%s", face_processor_range_name());
+    s_range_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 436, -72, range_btn_cb);
+    snprintf(b, sizeof(b), "DET:%s", face_processor_det_model_name());
+    s_det_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 12, -10, det_btn_cb);
+    snprintf(b, sizeof(b), "REC:%s", face_processor_feat_model_name());
+    s_rec_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 224, -10, rec_btn_cb);
+    snprintf(b, sizeof(b), "SPF:%s", face_processor_spoof_name());
+    s_spoof_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 436, -10, spoof_btn_cb);
 
     lvgl_port_unlock();
     ESP_LOGI(TAG, "UI initialized");

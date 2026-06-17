@@ -27,6 +27,7 @@ extern const uint8_t human_face_jpg_end[] asm("_binary_human_face_jpg_end");
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <string>
 #include <vector>
 
 static const char *TAG = "face_proc";
@@ -80,9 +81,55 @@ static const range_cfg_t RANGE_MODES[RANGE_COUNT] = {
 };
 static volatile int g_range_mode = RANGE_MED; // default; changed by the RANGE button
 
-// Runtime feature toggles (driven by the on-screen buttons).
-static volatile bool g_reco_enabled = true;
-static volatile bool g_spoof_enabled = false;
+/* ---- Switchable models (all packed into flash via CONFIG_FLASH_*) ----------
+ * Detector and recognizer can be swapped live from the on-screen DET/REC buttons.
+ * The swap is performed by the AI task between frames (it exclusively owns g_detect/
+ * g_recognizer); the buttons only post a request index.
+ */
+typedef struct {
+    HumanFaceDetect::model_type_t type;
+    const char *name;
+    bool has_kp; // provides 5-pt landmarks? ESPDet does not -> recognition disabled while active
+} det_model_cfg_t;
+static const det_model_cfg_t DET_MODELS[] = {
+    {HumanFaceDetect::MSRMNP_S8_V1, "MSRMNP", true},
+    {HumanFaceDetect::ESPDET_PICO_224_224_FACE, "ESPDet224", false},
+    {HumanFaceDetect::ESPDET_PICO_416_416_FACE, "ESPDet416", false},
+};
+#define DET_MODEL_COUNT ((int)(sizeof(DET_MODELS) / sizeof(DET_MODELS[0])))
+
+typedef struct {
+    HumanFaceFeat::model_type_t type;
+    const char *name;
+    const char *db_file;
+    float params_m, gflops, tar; // metrics: params(M), GFLOPs, TAR@FAR=1e-4 on IJB-C (%)
+} feat_model_cfg_t;
+static const feat_model_cfg_t FEAT_MODELS[] = {
+    {HumanFaceFeat::MFN_S8_V1, "MFN", "face_mfn.db", 1.2f, 0.46f, 90.03f},
+    {HumanFaceFeat::MBF_S8_V1, "MBF", "face_mbf.db", 3.4f, 0.90f, 93.94f},
+};
+#define FEAT_MODEL_COUNT ((int)(sizeof(FEAT_MODELS) / sizeof(FEAT_MODELS[0])))
+
+static const char *SPOOF_NAMES[] = {"Off", "Texture", "Tex+Motion"};
+#define SPOOF_MODE_COUNT 3
+
+static volatile int g_det_model_idx = 0;
+static volatile int g_feat_model_idx = 0;
+static volatile int g_spoof_mode = 0;
+static volatile bool g_det_has_kp = true; // mirrors DET_MODELS[g_det_model_idx].has_kp
+
+// Switch requests posted by the UI, consumed by the AI task (-1 = none).
+static volatile int g_det_switch_req = -1;
+static volatile int g_feat_switch_req = -1;
+
+static char g_db_dir[80]; // directory holding the per-model face databases
+
+// Recognition result cache (file scope so a model switch can invalidate it).
+static int64_t g_last_reco_us = 0;
+static bool g_reco_valid = false;
+static bool g_reco_recognized = false;
+static int g_reco_id = -1;
+static float g_reco_sim = 0.0f;
 
 // Dimensions/offset actually used for the in-flight AI job. frame_cb fills these in
 // when it hands a frame to the AI task; the busy handshake guarantees the AI task
@@ -198,6 +245,8 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
     }
     s_last_frame_us = t_frame;
 
+    float copy_this = 0.0f; // copy time charged to THIS frame (0 if AI was busy)
+
     // Hand a clean, cropped copy of the frame to the AI task if it is idle. The crop is a
     // centred window (size = the current range mode) taken row by row out of the full frame.
     if (!g_ai_busy && g_ai_buf) {
@@ -221,6 +270,7 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
             dst += dst_stride;
         }
         g_stats.copy_ms = (float)(esp_timer_get_time() - c0) / 1000.0f;
+        copy_this = g_stats.copy_ms;
 
         // Publish the dims used for THIS job before waking the AI task. Safe because the
         // AI task will not run (and frame_cb will not overwrite) until g_ai_busy clears.
@@ -248,15 +298,21 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
     ui_update_camera_canvas(buf, w, h);
     g_stats.disp_ms = (float)(esp_timer_get_time() - f0) / 1000.0f;
 
-    // Displayed frame rate, averaged over ~1 s windows.
+    // Displayed frame rate + core-0 compute load, averaged over ~1 s windows.
     static int64_t s_fps_t0 = 0;
     static int s_fps_n = 0;
+    static float s_l0_busy = 0.0f;
     s_fps_n++;
+    s_l0_busy += copy_this + g_stats.draw_ms + g_stats.disp_ms;
     if (s_fps_t0 == 0) {
         s_fps_t0 = t_frame;
     } else if (t_frame - s_fps_t0 >= 1000000) {
-        g_stats.fps = (float)s_fps_n * 1000000.0f / (float)(t_frame - s_fps_t0);
+        float secs = (float)(t_frame - s_fps_t0) / 1000000.0f;
+        g_stats.fps = (float)s_fps_n / secs;
+        float load = s_l0_busy / (secs * 1000.0f) * 100.0f;
+        g_stats.load_core0 = load > 100.0f ? 100.0f : load;
         s_fps_n = 0;
+        s_l0_busy = 0.0f;
         s_fps_t0 = t_frame;
     }
 }
@@ -354,6 +410,80 @@ static void calibrate_pix(dl::image::img_t &img)
 }
 #endif // CAM_AUTODETECT_PIX
 
+/* -------- model switching (performed ONLY by the AI task) -------- */
+
+// Re-read the active detector's input resolution, name and keypoint capability into g_stats.
+static void requery_det_info(void)
+{
+    dl::Model *m = g_detect->get_raw_model(0); // forces the lazy load
+    if (m && m->get_input() && m->get_input()->shape.size() >= 3) {
+        g_stats.model_in_h = m->get_input()->shape[1];
+        g_stats.model_in_w = m->get_input()->shape[2];
+    }
+    g_det_has_kp = DET_MODELS[g_det_model_idx].has_kp;
+    g_stats.det_has_kp = g_det_has_kp ? 1 : 0;
+    strncpy(g_stats.det_model, DET_MODELS[g_det_model_idx].name, sizeof(g_stats.det_model) - 1);
+    g_stats.det_model[sizeof(g_stats.det_model) - 1] = '\0';
+}
+
+static void apply_det_model(int idx)
+{
+    if (idx < 0 || idx >= DET_MODEL_COUNT) {
+        return;
+    }
+    HumanFaceDetect *nd = new HumanFaceDetect(DET_MODELS[idx].type);
+    nd->set_score_thr(DETECT_SCORE_THR, 0);
+    if (DET_MODELS[idx].type == HumanFaceDetect::MSRMNP_S8_V1) {
+        nd->set_score_thr(DETECT_SCORE_THR, 1); // MNP 2nd stage (single-stage ESPDet ignores idx 1)
+    }
+    HumanFaceDetect *old = g_detect;
+    g_detect = nd; // AI task owns g_detect; safe to swap here
+    delete old;
+    g_det_model_idx = idx;
+    g_reco_valid = false; // old recognition no longer applies
+    g_last_reco_us = 0;
+    requery_det_info();
+    ESP_LOGI(TAG, "detector -> %s (%dx%d, keypoints=%d)", DET_MODELS[idx].name, g_stats.model_in_w,
+             g_stats.model_in_h, (int)g_det_has_kp);
+    char st[80];
+    snprintf(st, sizeof(st), "Detector: %s%s", DET_MODELS[idx].name,
+             g_det_has_kp ? "" : "  (recognition off - no landmarks)");
+    ui_set_enroll_status(st);
+}
+
+static std::string feat_db_path(int idx)
+{
+    return std::string(g_db_dir) + "/" + FEAT_MODELS[idx].db_file;
+}
+
+static void apply_feat_model(int idx)
+{
+    if (idx < 0 || idx >= FEAT_MODEL_COUNT) {
+        return;
+    }
+    // Each recognizer keeps its OWN database file (different embedding spaces / feat_len), so
+    // switching never corrupts the other model's enrollments and needs no DB reset.
+    HumanFaceRecognizer *nr = new HumanFaceRecognizer(feat_db_path(idx), FEAT_MODELS[idx].type);
+    HumanFaceRecognizer *old = g_recognizer;
+    g_recognizer = nr; // AI task owns g_recognizer
+    delete old;
+    g_feat_model_idx = idx;
+    g_reco_valid = false;
+    g_last_reco_us = 0;
+    g_stats.feat_len = g_recognizer->get_feat_model()->get_feat_len();
+    g_stats.feat_params = FEAT_MODELS[idx].params_m;
+    g_stats.feat_gflops = FEAT_MODELS[idx].gflops;
+    g_stats.feat_tar = FEAT_MODELS[idx].tar;
+    strncpy(g_stats.reco_model, FEAT_MODELS[idx].name, sizeof(g_stats.reco_model) - 1);
+    g_stats.reco_model[sizeof(g_stats.reco_model) - 1] = '\0';
+    ESP_LOGI(TAG, "recognizer -> %s (feat_len=%d, db=%s, has %d face(s))", FEAT_MODELS[idx].name,
+             g_stats.feat_len, FEAT_MODELS[idx].db_file, g_recognizer->get_num_feats());
+    char st[80];
+    snprintf(st, sizeof(st), "Recognizer: %s  (its own DB: %d face(s))", FEAT_MODELS[idx].name,
+             g_recognizer->get_num_feats());
+    ui_set_enroll_status(st);
+}
+
 /* -------- AI task (core 1): detect + recognize on the clean copy -------- */
 static void ai_task(void *arg)
 {
@@ -367,6 +497,18 @@ static void ai_task(void *arg)
             g_recognizer->clear_all_feats();
             g_clear_request = false;
             ui_set_enroll_status("Database cleared");
+        }
+
+        // Apply any pending model switch (only the AI task touches g_detect/g_recognizer).
+        if (g_det_switch_req >= 0) {
+            int req = g_det_switch_req;
+            g_det_switch_req = -1;
+            apply_det_model(req);
+        }
+        if (g_feat_switch_req >= 0) {
+            int req = g_feat_switch_req;
+            g_feat_switch_req = -1;
+            apply_feat_model(req);
         }
 
         g_stats.det_busy = 1;
@@ -430,47 +572,51 @@ static void ai_task(void *arg)
 
         int64_t now_us = esp_timer_get_time();
         bool largest_ok = largest_det && (largest_det->box[2] - largest_det->box[0]) >= MIN_FACE_WIDTH;
+        // Recognition needs 5-pt landmarks; ESPDet detectors return none -> auto-disable.
+        bool can_recognize = largest_ok && (int)largest_det->keypoint.size() == 10;
 
         // --- Recognition: throttled (slow, ~200ms), only on the most prominent face ---
-        static int64_t s_last_reco_us = 0;
-        static bool s_reco_valid = false;
-        static bool s_reco_recognized = false;
-        static int s_reco_id = -1;
-        static float s_reco_sim = 0.0f;
-        g_stats.rec_state = (g_reco_enabled && largest_ok) ? 2 : 0; // 2 = face present, waiting for window
-        if (g_reco_enabled && largest_ok && (now_us - s_last_reco_us > RECOGNIZE_INTERVAL_US)) {
+        if (!g_det_has_kp) {
+            g_stats.rec_state = 3; // unavailable (detector has no landmarks)
+        } else {
+            g_stats.rec_state = largest_ok ? 2 : 0; // 2 = face present, waiting for window
+        }
+        if (can_recognize && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
             std::list<dl::detect::result_t> one = {*largest_det};
             int64_t rec0 = esp_timer_get_time();
             std::vector<dl::recognition::result_t> rec = g_recognizer->recognize(img, one);
             g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
             g_stats.rec_state = 1; // ran this frame
-            s_last_reco_us = now_us;
-            s_reco_valid = true;
+            g_last_reco_us = now_us;
+            g_reco_valid = true;
             if (!rec.empty()) {
-                s_reco_recognized = true;
-                s_reco_id = rec[0].id;
-                s_reco_sim = rec[0].similarity;
+                g_reco_recognized = true;
+                g_reco_id = rec[0].id;
+                g_reco_sim = rec[0].similarity;
             } else {
-                s_reco_recognized = false;
-                s_reco_id = -1;
-                s_reco_sim = 0.0f;
+                g_reco_recognized = false;
+                g_reco_id = -1;
+                g_reco_sim = 0.0f;
             }
         }
         // Reuse the most recent recognition result for the prominent face's box.
-        if (largest_idx >= 0 && s_reco_valid && (now_us - s_last_reco_us < RECO_STICKY_US)) {
-            local[largest_idx].recognized = s_reco_recognized;
-            local[largest_idx].id = s_reco_id;
-            local[largest_idx].sim = s_reco_sim;
+        if (largest_idx >= 0 && g_reco_valid && (now_us - g_last_reco_us < RECO_STICKY_US)) {
+            local[largest_idx].recognized = g_reco_recognized;
+            local[largest_idx].id = g_reco_id;
+            local[largest_idx].sim = g_reco_sim;
         }
 
         // Handle an enroll request on the most prominent face.
         if (g_enroll_request) {
-            if (largest_ok) {
+            if (!g_det_has_kp) {
+                ui_set_enroll_status("Switch to MSRMNP to enroll (ESPDet has no landmarks)");
+                g_enroll_request = false;
+            } else if (can_recognize) {
                 std::list<dl::detect::result_t> one = {*largest_det};
                 if (g_recognizer->enroll(img, one) == ESP_OK) {
-                    snprintf(status, sizeof(status), "Enrolled. DB now has %d face(s)",
-                             g_recognizer->get_num_feats());
-                    s_last_reco_us = 0; // re-recognize immediately so the new face turns green
+                    snprintf(status, sizeof(status), "Enrolled on %s. DB now %d face(s)",
+                             FEAT_MODELS[g_feat_model_idx].name, g_recognizer->get_num_feats());
+                    g_last_reco_us = 0; // re-recognize immediately so the new face turns green
                 } else {
                     snprintf(status, sizeof(status), "Enroll failed");
                 }
@@ -481,8 +627,11 @@ static void ai_task(void *arg)
             }
         }
 
-        // --- Exposure / glare on the whole analysed crop ---
-        {
+        // --- Exposure / glare on the whole analysed crop (throttled ~3 Hz: it only drives a
+        //     human-readable warning, so no need to scan the full crop every frame) ---
+        static int64_t s_expo_us = 0;
+        if (now_us - s_expo_us > 333000) {
+            s_expo_us = now_us;
             region_stats_t rs =
                 analyze_region((const uint16_t *)g_ai_buf, aw, ah, 0, 0, aw, ah, EXPOSURE_SAMPLE_STEP);
             g_stats.mean_luma = rs.mean_luma;
@@ -495,7 +644,7 @@ static void ai_task(void *arg)
         // Real faces carry rich texture; a flat photo has little, and a phone/monitor held up
         // tends to blow out (glare). NOT bank-grade - advisory only (esp-dl ships no liveness model).
         static int s_live_cx = -1, s_live_cy = -1;
-        if (g_spoof_enabled && largest_ok) {
+        if (g_spoof_mode != 0 && largest_ok) {
             // largest_det box is in CROP space, so it indexes g_ai_buf directly.
             region_stats_t fs = analyze_region((const uint16_t *)g_ai_buf, aw, ah, largest_det->box[0],
                                                largest_det->box[1], largest_det->box[2],
@@ -506,8 +655,8 @@ static void ai_task(void *arg)
             }
             int cx = (largest_det->box[0] + largest_det->box[2]) / 2;
             int cy = (largest_det->box[1] + largest_det->box[3]) / 2;
-            if (s_live_cx >= 0 && (abs(cx - s_live_cx) + abs(cy - s_live_cy)) > 4) {
-                score += 10; // natural movement -> evidence of a live subject (bonus only)
+            if (g_spoof_mode == 2 && s_live_cx >= 0 && (abs(cx - s_live_cx) + abs(cy - s_live_cy)) > 4) {
+                score += 10; // Tex+Motion mode: natural movement -> live (bonus only)
             }
             s_live_cx = cx;
             s_live_cy = cy;
@@ -546,8 +695,7 @@ static void ai_task(void *arg)
         // Publish live telemetry for the on-screen stats panel.
         g_stats.faces = n;
         g_stats.db_count = db_count;
-        g_stats.reco_on = g_reco_enabled ? 1 : 0;
-        g_stats.spoof_on = g_spoof_enabled ? 1 : 0;
+        g_stats.spoof_mode = g_spoof_mode;
         g_stats.range_mode = g_range_mode;
         g_stats.ai_w = aw;
         g_stats.ai_h = ah;
@@ -572,8 +720,34 @@ static void ai_task(void *arg)
                     g_stats.db_capacity = db_count + (int)(sf / (uint64_t)rec_sz);
                 }
             }
-            ESP_LOGI(TAG, "DET %d face(s) %dms  %s", n, ms,
-                     (n && local[show].recognized) ? "[recognized]" : "");
+            // Comprehensive CSV benchmark row (grep "BENCH," in the monitor; import to a sheet).
+            (void)ms;
+            (void)show;
+            ESP_LOGI("BENCH",
+                     "%s,%dx%d,%s,f%d,%s,fps=%.1f,cap=%.1f,det=%.1f,rec=%.1f,draw=%.1f,disp=%.1f,"
+                     "load0=%.0f,load1=%.0f,faces=%d,db=%d,int=%uKB,psram=%.1fMB,luma=%.0f,sat=%.0f,spoof=%s",
+                     g_stats.det_model, g_stats.model_in_w, g_stats.model_in_h, g_stats.reco_model,
+                     g_stats.feat_len, RANGE_MODES[g_range_mode].name, g_stats.fps, g_stats.cap_ms,
+                     g_stats.det_ms, g_stats.rec_ms, g_stats.draw_ms, g_stats.disp_ms, g_stats.load_core0,
+                     g_stats.load_core1, n, db_count, (unsigned)(g_stats.free_internal / 1024),
+                     g_stats.free_psram / 1048576.0f, g_stats.mean_luma, g_stats.sat_frac * 100.0f,
+                     SPOOF_NAMES[g_spoof_mode]);
+        }
+
+        // Core-1 "compute load": fraction of wall-clock the AI task spends working (1 s window).
+        {
+            int64_t job_end = esp_timer_get_time();
+            static int64_t s_l1_t0 = 0;
+            static float s_l1_busy = 0.0f;
+            s_l1_busy += (float)(job_end - t0) / 1000.0f;
+            if (s_l1_t0 == 0) {
+                s_l1_t0 = job_end;
+            } else if (job_end - s_l1_t0 >= 1000000) {
+                float load = s_l1_busy / ((float)(job_end - s_l1_t0) / 1000.0f) * 100.0f;
+                g_stats.load_core1 = load > 100.0f ? 100.0f : load;
+                s_l1_busy = 0.0f;
+                s_l1_t0 = job_end;
+            }
         }
 
         g_stats.det_busy = 0;
@@ -619,32 +793,46 @@ esp_err_t face_processor_init(const char *db_path)
         return ESP_ERR_NO_MEM;
     }
 
-    g_detect = new HumanFaceDetect();
-    g_detect->set_score_thr(DETECT_SCORE_THR, 0); // MSR stage
-    g_detect->set_score_thr(DETECT_SCORE_THR, 1); // MNP stage
-    g_recognizer = new HumanFaceRecognizer(std::string(db_path));
-    ESP_LOGI(TAG, "models created, DB has %d face(s)", g_recognizer->get_num_feats());
-
-    // Static info for the panel: model names, feature length, initial toggle/range state.
-    strncpy(g_stats.det_model, "msr+mnp_s8_v1", sizeof(g_stats.det_model) - 1);
-    strncpy(g_stats.reco_model, "mfn_s8_v1", sizeof(g_stats.reco_model) - 1);
-    g_stats.feat_len = g_recognizer->get_feat_model()->get_feat_len();
-    g_stats.reco_on = g_reco_enabled ? 1 : 0;
-    g_stats.spoof_on = g_spoof_enabled ? 1 : 0;
-    g_stats.range_mode = g_range_mode;
-
-    detect_selftest(); // also forces the (lazy) model load, so get_raw_model() is valid below
-
-    // Record the detector's true input resolution (NHWC) for the on-screen panel and
-    // to make the ROI squash factor visible. This is the number the range math hinges on.
-    g_stats.ai_w = RANGE_MODES[RANGE_MED].w;
-    g_stats.ai_h = RANGE_MODES[RANGE_MED].h;
-    dl::Model *msr = g_detect->get_raw_model(0);
-    if (msr && msr->get_input() && msr->get_input()->shape.size() >= 3) {
-        g_stats.model_in_h = msr->get_input()->shape[1];
-        g_stats.model_in_w = msr->get_input()->shape[2];
+    // Per-model face DBs live in the directory of the db_path app_main provided.
+    {
+        const char *slash = strrchr(db_path, '/');
+        size_t dlen = slash ? (size_t)(slash - db_path) : 0;
+        if (dlen == 0 || dlen >= sizeof(g_db_dir)) {
+            strncpy(g_db_dir, CONFIG_SPIFLASH_MOUNT_POINT, sizeof(g_db_dir) - 1);
+        } else {
+            memcpy(g_db_dir, db_path, dlen);
+            g_db_dir[dlen] = '\0';
+        }
     }
-    ESP_LOGI(TAG, "detector input %dx%d; range modes available, default '%s' (%dx%d) of %dx%d frame",
+
+    g_detect = new HumanFaceDetect(DET_MODELS[g_det_model_idx].type);
+    g_detect->set_score_thr(DETECT_SCORE_THR, 0);
+    if (DET_MODELS[g_det_model_idx].type == HumanFaceDetect::MSRMNP_S8_V1) {
+        g_detect->set_score_thr(DETECT_SCORE_THR, 1);
+    }
+    g_recognizer = new HumanFaceRecognizer(feat_db_path(g_feat_model_idx), FEAT_MODELS[g_feat_model_idx].type);
+    ESP_LOGI(TAG, "models created, recognizer DB '%s' has %d face(s)", FEAT_MODELS[g_feat_model_idx].db_file,
+             g_recognizer->get_num_feats());
+
+    // Active model info for the panel.
+    g_stats.feat_len = g_recognizer->get_feat_model()->get_feat_len();
+    g_stats.feat_params = FEAT_MODELS[g_feat_model_idx].params_m;
+    g_stats.feat_gflops = FEAT_MODELS[g_feat_model_idx].gflops;
+    g_stats.feat_tar = FEAT_MODELS[g_feat_model_idx].tar;
+    strncpy(g_stats.reco_model, FEAT_MODELS[g_feat_model_idx].name, sizeof(g_stats.reco_model) - 1);
+    static const char *LOC[] = {"flash_rodata", "flash_part", "sdcard"};
+    int loc = CONFIG_HUMAN_FACE_DETECT_MODEL_LOCATION;
+    strncpy(g_stats.model_loc, (loc >= 0 && loc < 3) ? LOC[loc] : "?", sizeof(g_stats.model_loc) - 1);
+    g_stats.range_mode = g_range_mode;
+    g_stats.ai_w = RANGE_MODES[g_range_mode].w;
+    g_stats.ai_h = RANGE_MODES[g_range_mode].h;
+
+    ESP_LOGI("BENCH", "columns: detector,input,recognizer,featlen,range,fps,cap_ms,det_ms,rec_ms,"
+                      "draw_ms,disp_ms,load0%%,load1%%,faces,db,int_free,psram_free,luma,sat%%,spoof");
+
+    detect_selftest();  // forces the (lazy) detector load so requery can read the input tensor
+    requery_det_info(); // input resolution + name + keypoint capability
+    ESP_LOGI(TAG, "detector '%s' input %dx%d; default range '%s' (%dx%d) of %dx%d frame", g_stats.det_model,
              g_stats.model_in_w, g_stats.model_in_h, RANGE_MODES[g_range_mode].name,
              RANGE_MODES[g_range_mode].w, RANGE_MODES[g_range_mode].h, CAM_H_RES, CAM_V_RES);
 
@@ -691,14 +879,41 @@ const char *face_processor_range_name(void)
     return RANGE_MODES[m].name;
 }
 
-int face_processor_toggle_reco(void)
+const char *face_processor_cycle_det_model(void)
 {
-    g_reco_enabled = !g_reco_enabled;
-    return g_reco_enabled ? 1 : 0;
+    int next = (g_det_model_idx + 1) % DET_MODEL_COUNT;
+    g_det_switch_req = next; // applied by the AI task between frames
+    return DET_MODELS[next].name;
 }
 
-int face_processor_toggle_spoof(void)
+const char *face_processor_cycle_feat_model(void)
 {
-    g_spoof_enabled = !g_spoof_enabled;
-    return g_spoof_enabled ? 1 : 0;
+    int next = (g_feat_model_idx + 1) % FEAT_MODEL_COUNT;
+    g_feat_switch_req = next;
+    return FEAT_MODELS[next].name;
+}
+
+const char *face_processor_det_model_name(void)
+{
+    int i = g_det_model_idx;
+    return (i >= 0 && i < DET_MODEL_COUNT) ? DET_MODELS[i].name : "?";
+}
+
+const char *face_processor_feat_model_name(void)
+{
+    int i = g_feat_model_idx;
+    return (i >= 0 && i < FEAT_MODEL_COUNT) ? FEAT_MODELS[i].name : "?";
+}
+
+const char *face_processor_cycle_spoof(void)
+{
+    int next = (g_spoof_mode + 1) % SPOOF_MODE_COUNT;
+    g_spoof_mode = next;
+    return SPOOF_NAMES[next];
+}
+
+const char *face_processor_spoof_name(void)
+{
+    int i = g_spoof_mode;
+    return (i >= 0 && i < SPOOF_MODE_COUNT) ? SPOOF_NAMES[i] : "?";
 }

@@ -20,13 +20,18 @@ typedef struct {
     float disp_ms;  // LVGL flush to the LCD (lv_refr_now)
     float fps;      // frames actually pushed to the panel per second
 
+    // Per-core compute load (busy time / wall time, %). Labelled "compute load", not
+    // scheduler CPU% - it is the fraction of wall-clock the main pipeline stages occupy.
+    float load_core0; // capture+copy+overlay+display task (core 0)
+    float load_core1; // detect+recognize AI task (core 1)
+
     // Current pipeline state.
     int faces;      // faces detected on the last AI frame
-    int db_count;   // enrolled faces in the database
+    int db_count;   // enrolled faces in the active model's database
     int det_busy;   // 1 while the AI task is mid inference, else 0
-    int rec_state;  // 0 = idle (no face), 1 = ran this frame, 2 = waiting for throttle window
-    int reco_on;    // recognition enabled
-    int spoof_on;   // anti-spoof (liveness) check enabled
+    int rec_state;  // 0 = idle (no face), 1 = ran, 2 = waiting for window, 3 = unavailable (no keypoints)
+    int det_has_kp; // active detector provides 5-pt landmarks (needed for recognition)
+    int spoof_mode; // 0 = off, 1 = texture, 2 = texture+motion
 
     // Exposure / glare (whole frame).
     float mean_luma; // average luma 0..255 of the analysed frame
@@ -46,13 +51,17 @@ typedef struct {
     uint32_t store_total, store_free; // bytes on the storage partition
     int db_capacity;                  // approx. max faces that fit
 
-    // Static configuration (filled once at init).
+    // Active model info.
     int model_in_w, model_in_h; // detector model input resolution
     int ai_w, ai_h;             // resolution actually fed to the detector (ROI crop or full frame)
     int feat_len;               // recognition feature vector length
     int range_mode;             // current range/crop mode index
     char det_model[24];         // detector model name
     char reco_model[24];        // recognizer model name
+    char model_loc[16];         // where models are stored (flash_rodata / partition / sdcard)
+    float feat_params;          // recognizer params (M)
+    float feat_gflops;          // recognizer GFLOPs
+    float feat_tar;             // recognizer accuracy TAR@FAR=1e-4 on IJB-C (%)
 } pipeline_stats_t;
 
 // Create the detector + recognizer (loading the feature DB from db_path), allocate
@@ -77,11 +86,18 @@ void face_processor_get_stats(pipeline_stats_t *out);
 void face_processor_cycle_range(void);
 const char *face_processor_range_name(void); // name of the current range mode
 
-// Enable/disable recognition; returns the new state. When off, only detection runs.
-int face_processor_toggle_reco(void);
+// Switch the detector / recognizer model at runtime (applied by the AI task between frames).
+// Each returns the name of the newly-selected model (for the button caption). ESPDet detectors
+// have no landmarks, so recognition auto-disables while one is active. Switching the recognizer
+// swaps to that model's own face database (per-model .db file) so enrollments are kept per model.
+const char *face_processor_cycle_det_model(void);
+const char *face_processor_cycle_feat_model(void);
+const char *face_processor_det_model_name(void);
+const char *face_processor_feat_model_name(void);
 
-// Enable/disable the (basic, heuristic) anti-spoof liveness check; returns the new state.
-int face_processor_toggle_spoof(void);
+// Cycle the (basic, heuristic) anti-spoof mode: Off -> Texture -> Texture+Motion. Returns its name.
+const char *face_processor_cycle_spoof(void);
+const char *face_processor_spoof_name(void);
 
 #ifdef __cplusplus
 }
