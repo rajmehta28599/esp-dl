@@ -1,0 +1,2 @@
+# Common defaults (target-independent). Target-specific values live in
+# sdkconfig.defaults.esp32p4.

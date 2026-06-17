@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS "app_main.cpp" "face_processor.cpp" "ui.cpp"
+    INCLUDE_DIRS "."
+    REQUIRES human_face_recognition
+             spiflash_fatfs
+             bsp_display
+             bsp_camera
+             esp_lvgl_port
+             lvgl
+    EMBED_FILES "human_face.jpg")

@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,   Size,   Flags
+# Partition table offset is 0x9000 (set in sdkconfig). The table is 0x1000 long, so the
+# first partition starts at 0xA000. The app (factory) partition must be 64KB-aligned.
+# Models are embedded in the app (flash_rodata), so the factory partition is large.
+# "storage" is a 1MB FAT partition that holds the face feature database (face.db).
+nvs,       data, nvs,     0xA000,   20K,
+phy_init,  data, phy,     0xf000,   4K,
+factory,   app,  factory, 0x10000,  10M,
+storage,   data, fat,     ,         1M,

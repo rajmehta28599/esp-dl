@@ -1,0 +1,21 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: ">=5.4.0"
+
+  # esp-dl face detection + recognition models (pulls human_face_detect + esp-dl).
+  espressif/human_face_recognition:
+    version: "*"
+    override_path: "../../../models/human_face_recognition"
+
+  # Display (EK79007 MIPI-DSI) + touch (GT911) + LVGL, matching Elecrow's BSP.
+  espressif/esp_lcd_ek79007: "^1.0.2"
+  espressif/esp_lcd_touch: "^1.1.0"
+  espressif/esp_lcd_touch_gt911: "^1.1.3"
+  espressif/esp_lvgl_port: "^2.6.0"
+  lvgl/lvgl: "^8.3.11"
+
+  # SC2336 MIPI-CSI camera pipeline.
+  espressif/esp_cam_sensor: "^1.2.0"
+  espressif/esp_sccb_intf: "^0.0.5"
+  espressif/esp_video: "^1.1.0"

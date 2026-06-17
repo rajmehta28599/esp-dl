@@ -11,8 +11,13 @@
 namespace dl {
 namespace audio {
 
+#ifndef MAX
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
+#endif
+
+#ifndef MIN
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+#endif
 #define M_2PI 6.283185307179586476925286766559005
 
 /**
