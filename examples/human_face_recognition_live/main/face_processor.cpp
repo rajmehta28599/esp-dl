@@ -5,6 +5,7 @@
 
 #include "human_face_detect.hpp"
 #include "human_face_recognition.hpp"
+#include "yunet_detect.hpp"
 #include "dl_image_define.hpp"
 #include "dl_image_draw.hpp"
 #include "dl_image_jpeg.hpp"
@@ -95,17 +96,36 @@ static volatile int g_range_mode = RANGE_MED; // default; changed by the RANGE b
  * The swap is performed by the AI task between frames (it exclusively owns g_detect/
  * g_recognizer); the buttons only post a request index.
  */
+typedef enum { DET_KIND_HFD, DET_KIND_YUNET } det_kind_t;
 typedef struct {
-    HumanFaceDetect::model_type_t type;
+    det_kind_t kind;
+    HumanFaceDetect::model_type_t hfd_type; // used only when kind == DET_KIND_HFD
     const char *name;
     bool has_kp; // provides 5-pt landmarks? ESPDet does not -> recognition disabled while active
 } det_model_cfg_t;
 static const det_model_cfg_t DET_MODELS[] = {
-    {HumanFaceDetect::MSRMNP_S8_V1, "MSRMNP", true},
-    {HumanFaceDetect::ESPDET_PICO_224_224_FACE, "ESPDet224", false},
-    {HumanFaceDetect::ESPDET_PICO_416_416_FACE, "ESPDet416", false},
+    // The two recognition-capable detectors (have 5 landmarks) are first/adjacent, so the DET
+    // button toggles MSRMNP <-> YuNet in one tap. ESPDet (detection-only) follows.
+    {DET_KIND_HFD, HumanFaceDetect::MSRMNP_S8_V1, "MSRMNP", true},
+    {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet", true}, // YuNet emits 5 landmarks
+    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_224_224_FACE, "ESPDet224", false},
+    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_416_416_FACE, "ESPDet416", false},
 };
 #define DET_MODEL_COUNT ((int)(sizeof(DET_MODELS) / sizeof(DET_MODELS[0])))
+
+// Build the detector for DET_MODELS[idx]. Only the AI task calls this (owns g_detect).
+static dl::detect::Detect *make_detector(int idx)
+{
+    if (DET_MODELS[idx].kind == DET_KIND_YUNET) {
+        return new YuNetDetect(); // score/nms/top_k defaults; tune in yunet_detect.cpp
+    }
+    HumanFaceDetect *h = new HumanFaceDetect(DET_MODELS[idx].hfd_type);
+    h->set_score_thr(DETECT_SCORE_THR, 0);
+    if (DET_MODELS[idx].hfd_type == HumanFaceDetect::MSRMNP_S8_V1) {
+        h->set_score_thr(DETECT_SCORE_THR, 1); // MNP 2nd stage (single-stage ESPDet ignores idx 1)
+    }
+    return h;
+}
 
 typedef struct {
     HumanFaceFeat::model_type_t type;
@@ -159,7 +179,7 @@ struct FaceBox {
     float score;
 };
 
-static HumanFaceDetect *g_detect = nullptr;
+static dl::detect::Detect *g_detect = nullptr; // MSRMNP/ESPDet (HumanFaceDetect) or YuNetDetect
 static HumanFaceRecognizer *g_recognizer = nullptr;
 
 static uint8_t *g_ai_buf = nullptr;
@@ -509,9 +529,15 @@ static void calibrate_pix(dl::image::img_t &img)
 static void requery_det_info(void)
 {
     dl::Model *m = g_detect->get_raw_model(0); // forces the lazy load
-    if (m && m->get_input() && m->get_input()->shape.size() >= 3) {
-        g_stats.model_in_h = m->get_input()->shape[1];
-        g_stats.model_in_w = m->get_input()->shape[2];
+    if (m && m->get_input() && m->get_input()->shape.size() >= 4) {
+        const std::vector<int> &sh = m->get_input()->shape;
+        if (sh[1] <= 4) { // NCHW [1,C,H,W] (YuNet)
+            g_stats.model_in_h = sh[2];
+            g_stats.model_in_w = sh[3];
+        } else { // NHWC [1,H,W,C] (esp-dl MSRMNP/ESPDet)
+            g_stats.model_in_h = sh[1];
+            g_stats.model_in_w = sh[2];
+        }
     }
     g_det_has_kp = DET_MODELS[g_det_model_idx].has_kp;
     g_stats.det_has_kp = g_det_has_kp ? 1 : 0;
@@ -524,12 +550,8 @@ static void apply_det_model(int idx)
     if (idx < 0 || idx >= DET_MODEL_COUNT) {
         return;
     }
-    HumanFaceDetect *nd = new HumanFaceDetect(DET_MODELS[idx].type);
-    nd->set_score_thr(DETECT_SCORE_THR, 0);
-    if (DET_MODELS[idx].type == HumanFaceDetect::MSRMNP_S8_V1) {
-        nd->set_score_thr(DETECT_SCORE_THR, 1); // MNP 2nd stage (single-stage ESPDet ignores idx 1)
-    }
-    HumanFaceDetect *old = g_detect;
+    dl::detect::Detect *nd = make_detector(idx);
+    dl::detect::Detect *old = g_detect;
     g_detect = nd; // AI task owns g_detect; safe to swap here
     delete old;
     g_det_model_idx = idx;
@@ -998,11 +1020,7 @@ esp_err_t face_processor_init(const char *db_path)
         }
     }
 
-    g_detect = new HumanFaceDetect(DET_MODELS[g_det_model_idx].type);
-    g_detect->set_score_thr(DETECT_SCORE_THR, 0);
-    if (DET_MODELS[g_det_model_idx].type == HumanFaceDetect::MSRMNP_S8_V1) {
-        g_detect->set_score_thr(DETECT_SCORE_THR, 1);
-    }
+    g_detect = make_detector(g_det_model_idx);
     g_recognizer = new HumanFaceRecognizer(feat_db_path(g_feat_model_idx), FEAT_MODELS[g_feat_model_idx].type);
     g_recognizer->set_thr(RECO_QUERY_THR); // return raw top-1 similarity; firmware decides accept
     ESP_LOGI(TAG, "models created, recognizer DB '%s' has %d face(s)", FEAT_MODELS[g_feat_model_idx].db_file,
