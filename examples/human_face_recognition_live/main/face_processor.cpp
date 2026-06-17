@@ -20,8 +20,11 @@ extern const uint8_t human_face_jpg_end[] asm("_binary_human_face_jpg_end");
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_vfs_fat.h"
+#include "sdkconfig.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <vector>
@@ -40,6 +43,7 @@ static const char *TAG = "face_proc";
 #define RGB565_GREEN 0x07E0
 #define RGB565_RED 0xF800
 #define RGB565_YELLOW 0xFFE0
+#define RGB565_MAGENTA 0xF81F // suspected-spoof face box
 
 #define MAX_FACES 5
 // Only enroll/recognize faces at least this wide (px) to avoid junk features.
@@ -47,34 +51,43 @@ static const char *TAG = "face_proc";
 // Detector score threshold (lower = more permissive). MSRMNP has two stages.
 #define DETECT_SCORE_THR 0.3f
 
-/* ---- Detection ROI (range + speed) ----------------------------------------
- * The SC2336 delivers 1024x600. The detector internally squashes whatever we feed
- * it to a small square model input (resolution logged at boot as model_in_w/h).
- * Feeding the full 1024-wide frame squashes the X axis by ~0.25, so a face at ~1 m
- * shrinks below the smallest detector anchor and is missed. Cropping a centred
- * square (full sensor height) roughly halves the squash, enlarging a 1 m face
- * ~1.7x in model space so it lands on a real anchor and is detected at range.
- * It is also CHEAPER: we copy AI_W*AI_H instead of the whole 1024x600 frame.
+/* ---- Detection range / ROI crop -------------------------------------------
+ * The SC2336 delivers 1024x600 but the detector squashes its input down to a tiny
+ * 160x120 (4:3) tensor (logged at boot). Feeding the full 1024-wide frame squashes
+ * X by ~0.16, so a face at ~1 m shrinks below the detector's smallest anchor and is
+ * missed. Feeding a centred 4:3 crop instead reduces the squash (a tighter crop ->
+ * bigger faces in the tensor -> longer usable range), at the cost of field of view.
+ * All crops are 4:3 to match the tensor so faces are not distorted.
  *
- * The detector returns boxes/keypoints in CROP space; we add the crop offset only
- * where boxes are stored for the on-screen overlay (draw_overlays stays in full-
- * frame space). Recognition runs on the very same crop, so its keypoints remain
- * self-consistent and the proven MSRMNP keypoint -> alignment path is untouched.
+ * The crop is taken row by row during the frame->AI-buffer copy (cheaper than the
+ * old full-frame memcpy). The detector returns boxes/keypoints in CROP space; the
+ * crop offset is added only where boxes are stored for the overlay (draw_overlays
+ * stays in full-frame space). Recognition runs on the same crop, so its keypoints
+ * stay self-consistent and the MSRMNP keypoint -> alignment path is untouched.
  *
- * Set CROP_ENABLE to 0 to fall back to the full frame (e.g. if a coordinate bug is
- * suspected) without otherwise changing the pipeline.
+ * The mode is switchable live from the on-screen RANGE button.
  */
-#define CROP_ENABLE 1
-#if CROP_ENABLE
-#define AI_W 600 // centred crop width  (<= CAM_H_RES)
-#define AI_H 600 // centred crop height (<= CAM_V_RES)
-#else
-#define AI_W CAM_H_RES
-#define AI_H CAM_V_RES
-#endif
-#define AI_X_OFF ((CAM_H_RES - (AI_W)) / 2)
-#define AI_Y_OFF ((CAM_V_RES - (AI_H)) / 2)
-static_assert(AI_W <= CAM_H_RES && AI_H <= CAM_V_RES, "detection ROI must fit inside the camera frame");
+typedef enum { RANGE_FULL = 0, RANGE_WIDE, RANGE_MED, RANGE_TIGHT, RANGE_COUNT } range_mode_t;
+typedef struct {
+    const char *name;
+    int w, h; // centred crop size, must fit inside CAM_H_RES x CAM_V_RES and be 4:3-ish
+} range_cfg_t;
+static const range_cfg_t RANGE_MODES[RANGE_COUNT] = {
+    {"Full", CAM_H_RES, CAM_V_RES}, // whole frame, widest FOV, most squash (shortest range)
+    {"Wide", 800, 600},             // 4:3
+    {"Med", 640, 480},              // 4:3
+    {"Tight", 480, 360},            // 4:3, biggest faces in tensor (longest range), narrow FOV
+};
+static volatile int g_range_mode = RANGE_MED; // default; changed by the RANGE button
+
+// Runtime feature toggles (driven by the on-screen buttons).
+static volatile bool g_reco_enabled = true;
+static volatile bool g_spoof_enabled = false;
+
+// Dimensions/offset actually used for the in-flight AI job. frame_cb fills these in
+// when it hands a frame to the AI task; the busy handshake guarantees the AI task
+// reads the same values frame_cb used for the copy (no mid-job change).
+static volatile int g_ai_w = 640, g_ai_h = 480, g_ai_xoff = 192, g_ai_yoff = 60;
 
 // Live telemetry shared with the UI (see pipeline_stats_t). Plain scalars, no lock.
 static pipeline_stats_t g_stats = {};
@@ -84,6 +97,7 @@ struct FaceBox {
     int kp[10];
     int kp_n;
     bool recognized;
+    bool spoof; // suspected spoof (basic liveness heuristic)
     int id;
     float sim;
     float score;
@@ -157,7 +171,8 @@ static void draw_overlays(dl::image::img_t &img)
         if (x2 <= x1 || y2 <= y1) {
             continue;
         }
-        auto color = color565(local[i].recognized ? RGB565_GREEN : RGB565_RED);
+        uint16_t bc = local[i].spoof ? RGB565_MAGENTA : (local[i].recognized ? RGB565_GREEN : RGB565_RED);
+        auto color = color565(bc);
         dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, color, 5);
 
         auto kp_color = color565(RGB565_YELLOW);
@@ -183,20 +198,36 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
     }
     s_last_frame_us = t_frame;
 
-    // Hand a clean (optionally cropped) copy of the frame to the AI task if it is idle.
-    // The crop is a centred AI_W x AI_H window taken row by row out of the full frame.
-    if (!g_ai_busy && g_ai_buf && (int)w >= AI_X_OFF + AI_W && (int)h >= AI_Y_OFF + AI_H) {
+    // Hand a clean, cropped copy of the frame to the AI task if it is idle. The crop is a
+    // centred window (size = the current range mode) taken row by row out of the full frame.
+    if (!g_ai_busy && g_ai_buf) {
+        int m = g_range_mode;
+        if (m < 0 || m >= RANGE_COUNT) {
+            m = RANGE_MED;
+        }
+        int cw = RANGE_MODES[m].w, ch = RANGE_MODES[m].h;
+        if (cw > (int)w) cw = (int)w;
+        if (ch > (int)h) ch = (int)h;
+        int xoff = ((int)w - cw) / 2, yoff = ((int)h - ch) / 2;
+
         int64_t c0 = esp_timer_get_time();
         const int src_stride = (int)w * 2;     // bytes per source row (RGB565)
-        const int dst_stride = AI_W * 2;       // bytes per crop row
-        const uint8_t *src = buf + (size_t)AI_Y_OFF * src_stride + (size_t)AI_X_OFF * 2;
+        const int dst_stride = cw * 2;         // bytes per crop row
+        const uint8_t *src = buf + (size_t)yoff * src_stride + (size_t)xoff * 2;
         uint8_t *dst = g_ai_buf;
-        for (int row = 0; row < AI_H; row++) {
+        for (int row = 0; row < ch; row++) {
             memcpy(dst, src, dst_stride);
             src += src_stride;
             dst += dst_stride;
         }
         g_stats.copy_ms = (float)(esp_timer_get_time() - c0) / 1000.0f;
+
+        // Publish the dims used for THIS job before waking the AI task. Safe because the
+        // AI task will not run (and frame_cb will not overwrite) until g_ai_busy clears.
+        g_ai_w = cw;
+        g_ai_h = ch;
+        g_ai_xoff = xoff;
+        g_ai_yoff = yoff;
         g_ai_busy = true;
         if (g_ai_task) {
             xTaskNotifyGive(g_ai_task);
@@ -228,6 +259,69 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
         s_fps_n = 0;
         s_fps_t0 = t_frame;
     }
+}
+
+/* -------- exposure / glare / liveness analysis on the AI buffer -------- */
+// Thresholds (tunable; the live panel shows the raw numbers so they can be recalibrated).
+#define EXPOSURE_SAMPLE_STEP 6 // sample every Nth pixel for the whole-frame exposure scan
+#define BRIGHT_LUMA_THR 200.0f // mean luma above this -> "too bright"
+#define GLARE_SAT_THR 0.18f    // blown-highlight fraction above this -> "glare"
+#define LIVE_TEXTURE_K 4.0f    // face texture energy -> score gain
+#define LIVE_SPOOF_THR 25      // liveness score below this -> suspected spoof
+#define LIVE_SAT_THR 0.25f     // face this blown-out -> likely a screen/glare -> penalise
+
+static inline int luma_bgr565(uint16_t p)
+{
+    // RGB565/BGR565 differ only in which 5-bit field is R vs B; for a luma estimate the
+    // small weight swap is irrelevant. Expand 5/6-bit fields to 8-bit and take ~(a+2g+b)/4.
+    int a = ((p >> 11) & 0x1F) << 3;
+    int g = ((p >> 5) & 0x3F) << 2;
+    int b = (p & 0x1F) << 3;
+    return (a + 2 * g + b) >> 2;
+}
+
+struct region_stats_t {
+    float mean_luma; // 0..255
+    float sat_frac;  // 0..1 fraction of near-white pixels
+    float texture;   // mean |horizontal luma gradient| (high = lots of detail)
+};
+
+// Scan a rectangular region of the (BGR565) AI buffer with the given pixel step.
+static region_stats_t analyze_region(const uint16_t *buf, int bw, int bh, int x0, int y0, int x1,
+                                     int y1, int step)
+{
+    region_stats_t s = {0.0f, 0.0f, 0.0f};
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > bw) x1 = bw;
+    if (y1 > bh) y1 = bh;
+    if (step < 1) step = 1;
+    long sum = 0, sat = 0, grad = 0, n = 0, gn = 0;
+    for (int y = y0; y < y1; y += step) {
+        const uint16_t *row = buf + (size_t)y * bw;
+        int prev = -1;
+        for (int x = x0; x < x1; x += step) {
+            int l = luma_bgr565(row[x]);
+            sum += l;
+            n++;
+            if (l >= 245) {
+                sat++;
+            }
+            if (prev >= 0) {
+                grad += abs(l - prev);
+                gn++;
+            }
+            prev = l;
+        }
+    }
+    if (n > 0) {
+        s.mean_luma = (float)sum / (float)n;
+        s.sat_frac = (float)sat / (float)n;
+    }
+    if (gn > 0) {
+        s.texture = (float)grad / (float)gn;
+    }
+    return s;
 }
 
 #if CAM_AUTODETECT_PIX
@@ -276,10 +370,12 @@ static void ai_task(void *arg)
         }
 
         g_stats.det_busy = 1;
+        // Dimensions/offset for this job, as set by frame_cb (stable until g_ai_busy clears).
+        const int aw = g_ai_w, ah = g_ai_h, axoff = g_ai_xoff, ayoff = g_ai_yoff;
         dl::image::img_t img = {
             .data = g_ai_buf,
-            .width = (uint16_t)AI_W,
-            .height = (uint16_t)AI_H,
+            .width = (uint16_t)aw,
+            .height = (uint16_t)ah,
             .pix_type = g_infer_pix,
         };
 
@@ -291,7 +387,9 @@ static void ai_task(void *arg)
         img.pix_type = g_infer_pix;
 #endif
         // --- Detection: runs every frame (cheap, ~40ms) ---
+        int64_t det0 = esp_timer_get_time();
         std::list<dl::detect::result_t> &dets = g_detect->run(img);
+        g_stats.det_ms = (float)(esp_timer_get_time() - det0) / 1000.0f;
 
         FaceBox local[MAX_FACES];
         int n = 0;
@@ -304,16 +402,19 @@ static void ai_task(void *arg)
             if (d.box.size() < 4) {
                 continue;
             }
+            // Detector coordinates are in CROP space; shift to full-frame space for the
+            // on-screen overlay. (offset is 0 in Full mode.)
             FaceBox fb;
-            fb.x1 = d.box[0];
-            fb.y1 = d.box[1];
-            fb.x2 = d.box[2];
-            fb.y2 = d.box[3];
+            fb.x1 = d.box[0] + axoff;
+            fb.y1 = d.box[1] + ayoff;
+            fb.x2 = d.box[2] + axoff;
+            fb.y2 = d.box[3] + ayoff;
             fb.kp_n = std::min<int>(d.keypoint.size(), 10);
             for (int k = 0; k < fb.kp_n; k++) {
-                fb.kp[k] = d.keypoint[k];
+                fb.kp[k] = d.keypoint[k] + ((k & 1) ? ayoff : axoff);
             }
             fb.recognized = false;
+            fb.spoof = false;
             fb.id = -1;
             fb.sim = 0.0f;
             fb.score = d.score;
@@ -336,9 +437,13 @@ static void ai_task(void *arg)
         static bool s_reco_recognized = false;
         static int s_reco_id = -1;
         static float s_reco_sim = 0.0f;
-        if (largest_ok && (now_us - s_last_reco_us > RECOGNIZE_INTERVAL_US)) {
+        g_stats.rec_state = (g_reco_enabled && largest_ok) ? 2 : 0; // 2 = face present, waiting for window
+        if (g_reco_enabled && largest_ok && (now_us - s_last_reco_us > RECOGNIZE_INTERVAL_US)) {
             std::list<dl::detect::result_t> one = {*largest_det};
+            int64_t rec0 = esp_timer_get_time();
             std::vector<dl::recognition::result_t> rec = g_recognizer->recognize(img, one);
+            g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
+            g_stats.rec_state = 1; // ran this frame
             s_last_reco_us = now_us;
             s_reco_valid = true;
             if (!rec.empty()) {
@@ -376,6 +481,48 @@ static void ai_task(void *arg)
             }
         }
 
+        // --- Exposure / glare on the whole analysed crop ---
+        {
+            region_stats_t rs =
+                analyze_region((const uint16_t *)g_ai_buf, aw, ah, 0, 0, aw, ah, EXPOSURE_SAMPLE_STEP);
+            g_stats.mean_luma = rs.mean_luma;
+            g_stats.sat_frac = rs.sat_frac;
+            g_stats.bright = (rs.mean_luma > BRIGHT_LUMA_THR) ? 1 : 0;
+            g_stats.glare = (rs.sat_frac > GLARE_SAT_THR) ? 1 : 0;
+        }
+
+        // --- Anti-spoof (basic heuristic) on the most prominent face ---
+        // Real faces carry rich texture; a flat photo has little, and a phone/monitor held up
+        // tends to blow out (glare). NOT bank-grade - advisory only (esp-dl ships no liveness model).
+        static int s_live_cx = -1, s_live_cy = -1;
+        if (g_spoof_enabled && largest_ok) {
+            // largest_det box is in CROP space, so it indexes g_ai_buf directly.
+            region_stats_t fs = analyze_region((const uint16_t *)g_ai_buf, aw, ah, largest_det->box[0],
+                                               largest_det->box[1], largest_det->box[2],
+                                               largest_det->box[3], 2);
+            int score = (int)(fs.texture * LIVE_TEXTURE_K);
+            if (fs.sat_frac > LIVE_SAT_THR) {
+                score -= 40; // blown-out face -> likely a screen/photo under glare
+            }
+            int cx = (largest_det->box[0] + largest_det->box[2]) / 2;
+            int cy = (largest_det->box[1] + largest_det->box[3]) / 2;
+            if (s_live_cx >= 0 && (abs(cx - s_live_cx) + abs(cy - s_live_cy)) > 4) {
+                score += 10; // natural movement -> evidence of a live subject (bonus only)
+            }
+            s_live_cx = cx;
+            s_live_cy = cy;
+            score = score < 0 ? 0 : (score > 100 ? 100 : score);
+            g_stats.live_score = score;
+            g_stats.spoof_state = (score < LIVE_SPOOF_THR) ? 2 : 1;
+            if (largest_idx >= 0 && g_stats.spoof_state == 2) {
+                local[largest_idx].spoof = true;
+            }
+        } else {
+            g_stats.spoof_state = 0;
+            g_stats.live_score = 0;
+            s_live_cx = s_live_cy = -1;
+        }
+
         // Publish results for the display overlay.
         if (xSemaphoreTake(g_results_mtx, portMAX_DELAY) == pdTRUE) {
             memcpy(g_results, local, sizeof(FaceBox) * n);
@@ -384,4 +531,174 @@ static void ai_task(void *arg)
         }
 
         int ms = (int)((esp_timer_get_time() - t0) / 1000);
-  
+        int show = (largest_idx >= 0) ? largest_idx : 0;
+        int db_count = g_recognizer->get_num_feats();
+        if (n == 0) {
+            snprintf(status, sizeof(status), "Faces: 0    DB: %d", db_count);
+        } else if (local[show].recognized) {
+            snprintf(status, sizeof(status), "Faces: %d    ID %d  (%.2f)    DB: %d",
+                     n, local[show].id, local[show].sim, db_count);
+        } else {
+            snprintf(status, sizeof(status), "Faces: %d    unknown    DB: %d", n, db_count);
+        }
+        ui_set_status(status);
+
+        // Publish live telemetry for the on-screen stats panel.
+        g_stats.faces = n;
+        g_stats.db_count = db_count;
+        g_stats.reco_on = g_reco_enabled ? 1 : 0;
+        g_stats.spoof_on = g_spoof_enabled ? 1 : 0;
+        g_stats.range_mode = g_range_mode;
+        g_stats.ai_w = aw;
+        g_stats.ai_h = ah;
+        g_stats.free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        g_stats.total_internal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+        g_stats.largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        g_stats.min_free_internal = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+        g_stats.free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        g_stats.total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        g_stats.largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+        // Throttled serial diagnostics + storage capacity (~1 Hz; FAT info is relatively costly).
+        static int64_t last_log_us = 0;
+        if (now_us - last_log_us > 1000000) {
+            last_log_us = now_us;
+            uint64_t st = 0, sf = 0;
+            if (esp_vfs_fat_info(CONFIG_SPIFLASH_MOUNT_POINT, &st, &sf) == ESP_OK) {
+                g_stats.store_total = (uint32_t)st;
+                g_stats.store_free = (uint32_t)sf;
+                int rec_sz = g_stats.feat_len * (int)sizeof(float) + (int)sizeof(uint16_t);
+                if (rec_sz > 0) {
+                    g_stats.db_capacity = db_count + (int)(sf / (uint64_t)rec_sz);
+                }
+            }
+            ESP_LOGI(TAG, "DET %d face(s) %dms  %s", n, ms,
+                     (n && local[show].recognized) ? "[recognized]" : "");
+        }
+
+        g_stats.det_busy = 0;
+        g_ai_busy = false;
+    }
+}
+
+/* Run the detector once on the embedded known-good image. This isolates a camera-image
+ * problem (selftest finds the face, live camera doesn't) from a model/threshold problem
+ * (selftest also finds nothing). */
+static void detect_selftest(void)
+{
+    dl::image::jpeg_img_t jpeg = {
+        .data = (void *)human_face_jpg_start,
+        .data_len = (size_t)(human_face_jpg_end - human_face_jpg_start),
+    };
+    dl::image::img_t img = dl::image::sw_decode_jpeg(jpeg, dl::image::DL_IMAGE_PIX_TYPE_RGB888);
+    if (!img.data) {
+        ESP_LOGE(TAG, "SELFTEST: jpeg decode failed");
+        return;
+    }
+    std::list<dl::detect::result_t> &dets = g_detect->run(img);
+    ESP_LOGW(TAG, "SELFTEST embedded %dx%d image -> %d face(s)", img.width, img.height, (int)dets.size());
+    int i = 0;
+    for (auto &d : dets) {
+        ESP_LOGW(TAG, "  selftest #%d score=%.2f box=[%d,%d,%d,%d]", i++, d.score, d.box[0], d.box[1],
+                 d.box[2], d.box[3]);
+    }
+    heap_caps_free(img.data);
+}
+
+esp_err_t face_processor_init(const char *db_path)
+{
+    g_results_mtx = xSemaphoreCreateMutex();
+    if (!g_results_mtx) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    g_ai_buf_len = (size_t)CAM_H_RES * CAM_V_RES * 2;
+    g_ai_buf = (uint8_t *)heap_caps_malloc(g_ai_buf_len, MALLOC_CAP_SPIRAM);
+    if (!g_ai_buf) {
+        ESP_LOGE(TAG, "failed to allocate AI buffer (%u bytes)", (unsigned)g_ai_buf_len);
+        return ESP_ERR_NO_MEM;
+    }
+
+    g_detect = new HumanFaceDetect();
+    g_detect->set_score_thr(DETECT_SCORE_THR, 0); // MSR stage
+    g_detect->set_score_thr(DETECT_SCORE_THR, 1); // MNP stage
+    g_recognizer = new HumanFaceRecognizer(std::string(db_path));
+    ESP_LOGI(TAG, "models created, DB has %d face(s)", g_recognizer->get_num_feats());
+
+    // Static info for the panel: model names, feature length, initial toggle/range state.
+    strncpy(g_stats.det_model, "msr+mnp_s8_v1", sizeof(g_stats.det_model) - 1);
+    strncpy(g_stats.reco_model, "mfn_s8_v1", sizeof(g_stats.reco_model) - 1);
+    g_stats.feat_len = g_recognizer->get_feat_model()->get_feat_len();
+    g_stats.reco_on = g_reco_enabled ? 1 : 0;
+    g_stats.spoof_on = g_spoof_enabled ? 1 : 0;
+    g_stats.range_mode = g_range_mode;
+
+    detect_selftest(); // also forces the (lazy) model load, so get_raw_model() is valid below
+
+    // Record the detector's true input resolution (NHWC) for the on-screen panel and
+    // to make the ROI squash factor visible. This is the number the range math hinges on.
+    g_stats.ai_w = RANGE_MODES[RANGE_MED].w;
+    g_stats.ai_h = RANGE_MODES[RANGE_MED].h;
+    dl::Model *msr = g_detect->get_raw_model(0);
+    if (msr && msr->get_input() && msr->get_input()->shape.size() >= 3) {
+        g_stats.model_in_h = msr->get_input()->shape[1];
+        g_stats.model_in_w = msr->get_input()->shape[2];
+    }
+    ESP_LOGI(TAG, "detector input %dx%d; range modes available, default '%s' (%dx%d) of %dx%d frame",
+             g_stats.model_in_w, g_stats.model_in_h, RANGE_MODES[g_range_mode].name,
+             RANGE_MODES[g_range_mode].w, RANGE_MODES[g_range_mode].h, CAM_H_RES, CAM_V_RES);
+
+    video_register_frame_operation_cb(frame_cb);
+
+    // Pin AI to core 1 (APP CPU); camera+display run on core 0.
+    BaseType_t ok = xTaskCreatePinnedToCore(ai_task, "face_ai", 1024 * 12, nullptr, 4, &g_ai_task, 1);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "failed to create AI task");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void face_processor_request_enroll(void)
+{
+    g_enroll_request = true;
+}
+
+void face_processor_clear_db(void)
+{
+    g_clear_request = true;
+}
+
+void face_processor_get_stats(pipeline_stats_t *out)
+{
+    if (out) {
+        *out = g_stats; // scalar fields; a torn snapshot is cosmetically harmless
+    }
+}
+
+void face_processor_cycle_range(void)
+{
+    int m = g_range_mode + 1;
+    g_range_mode = (m >= RANGE_COUNT) ? 0 : m;
+}
+
+const char *face_processor_range_name(void)
+{
+    int m = g_range_mode;
+    if (m < 0 || m >= RANGE_COUNT) {
+        m = RANGE_MED;
+    }
+    return RANGE_MODES[m].name;
+}
+
+int face_processor_toggle_reco(void)
+{
+    g_reco_enabled = !g_reco_enabled;
+    return g_reco_enabled ? 1 : 0;
+}
+
+int face_processor_toggle_spoof(void)
+{
+    g_spoof_enabled = !g_spoof_enabled;
+    return g_spoof_enabled ? 1 : 0;
+}

@@ -25,15 +25,34 @@ typedef struct {
     int db_count;   // enrolled faces in the database
     int det_busy;   // 1 while the AI task is mid inference, else 0
     int rec_state;  // 0 = idle (no face), 1 = ran this frame, 2 = waiting for throttle window
+    int reco_on;    // recognition enabled
+    int spoof_on;   // anti-spoof (liveness) check enabled
+
+    // Exposure / glare (whole frame).
+    float mean_luma; // average luma 0..255 of the analysed frame
+    float sat_frac;  // fraction 0..1 of near-white (blown-out) pixels
+    int bright;      // 1 = scene too bright
+    int glare;       // 1 = strong glare / blown highlights
+
+    // Anti-spoof (liveness) of the most prominent face.
+    int spoof_state; // 0 = n/a (off / no face), 1 = looks live, 2 = suspected spoof
+    int live_score;  // 0..100 heuristic liveness score
 
     // Memory, in bytes.
-    uint32_t free_internal;     // free internal RAM
-    uint32_t free_psram;        // free PSRAM
-    uint32_t min_free_internal; // lowest internal RAM seen since boot
+    uint32_t free_internal, total_internal, largest_internal, min_free_internal;
+    uint32_t free_psram, total_psram, largest_psram;
+
+    // Face-database storage (the on-flash FAT partition).
+    uint32_t store_total, store_free; // bytes on the storage partition
+    int db_capacity;                  // approx. max faces that fit
 
     // Static configuration (filled once at init).
     int model_in_w, model_in_h; // detector model input resolution
     int ai_w, ai_h;             // resolution actually fed to the detector (ROI crop or full frame)
+    int feat_len;               // recognition feature vector length
+    int range_mode;             // current range/crop mode index
+    char det_model[24];         // detector model name
+    char reco_model[24];        // recognizer model name
 } pipeline_stats_t;
 
 // Create the detector + recognizer (loading the feature DB from db_path), allocate
@@ -52,6 +71,17 @@ void face_processor_clear_db(void);
 // Snapshot the live pipeline/memory telemetry for on-screen display. Safe to call
 // from the UI thread (see the note on pipeline_stats_t).
 void face_processor_get_stats(pipeline_stats_t *out);
+
+// Cycle the detection range/crop mode (Full -> Wide -> Med -> Tight -> ...). A tighter
+// crop enlarges distant faces in the detector's input, extending usable range.
+void face_processor_cycle_range(void);
+const char *face_processor_range_name(void); // name of the current range mode
+
+// Enable/disable recognition; returns the new state. When off, only detection runs.
+int face_processor_toggle_reco(void);
+
+// Enable/disable the (basic, heuristic) anti-spoof liveness check; returns the new state.
+int face_processor_toggle_spoof(void);
 
 #ifdef __cplusplus
 }
