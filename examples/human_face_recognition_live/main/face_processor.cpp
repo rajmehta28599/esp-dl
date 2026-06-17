@@ -24,10 +24,13 @@ extern const uint8_t human_face_jpg_end[] asm("_binary_human_face_jpg_end");
 #include "sdkconfig.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <list>
 #include <string>
+#include <sys/time.h>
 #include <vector>
 
 static const char *TAG = "face_proc";
@@ -45,6 +48,12 @@ static const char *TAG = "face_proc";
 #define RGB565_RED 0xF800
 #define RGB565_YELLOW 0xFFE0
 #define RGB565_MAGENTA 0xF81F // suspected-spoof face box
+
+// Mirror the shown image left<->right so the person's left appears on the screen's left.
+// DISPLAY-ONLY: applied after overlays + after the AI copy, so detection, recognition and the
+// face DB are unaffected, and the LVGL text/buttons (composited separately) are NOT mirrored.
+// If the flip is the wrong way for your camera mounting, set this to 0.
+#define DISPLAY_MIRROR_X 1
 
 #define MAX_FACES 5
 // Only enroll/recognize faces at least this wide (px) to avoid junk features.
@@ -183,6 +192,43 @@ static bool g_pix_locked = true;
 #define RECOGNIZE_INTERVAL_US 450000 // ~2 Hz
 #define RECO_STICKY_US 2000000       // keep the last recognition on the box for up to 2s
 
+// TAR/FAR measurement: the recognizer's query threshold is set very low so recognize() always
+// returns the top-1 match with its RAW cosine similarity; the firmware then accepts at
+// RECO_ACCEPT_THR and logs every score (VERIFY,...) so genuine vs impostor distributions can be
+// built on-device. Raise/lower RECO_ACCEPT_THR to trade TAR vs FAR.
+#define RECO_QUERY_THR -1.0f
+#define RECO_ACCEPT_THR 0.5f
+
+/* ---- Distance estimation + positioning guide -------------------------------
+ * Estimated from the largest face using the pinhole model dist = K / size_px.
+ * Inter-pupil distance (IPD, real ~63 mm) is the primary, steadier, pose-independent
+ * estimator; the box width is a fallback. K is a per-deployment calibration constant:
+ * stand at a known distance, read ipd_px/box width from the dashboard, then
+ *   DIST_K_IPD = ipd_px * known_mm   (and DIST_K_BOX = box_px * known_mm).
+ * The defaults are rough starting points - recalibrate on the real lens.
+ */
+#define DIST_K_IPD 39000.0f // ~ 65 px IPD at 600 mm (placeholder - calibrate!)
+#define DIST_K_BOX 90000.0f // ~150 px box at 600 mm (placeholder - calibrate!)
+#define DIST_OK_MIN_MM 450  // ideal capture band
+#define DIST_OK_MAX_MM 750
+#define DIST_HYST_MM 40     // hysteresis so the guide does not oscillate at the edges
+#define DIST_EMA 0.4f       // distance smoothing factor (0..1, higher = snappier)
+
+/* ---- Punch (attendance event) --------------------------------------------- */
+#define PUNCH_W 100                 // thumbnail size (RGB565)
+#define PUNCH_H 100
+#define PUNCH_DEBOUNCE_US 5000000   // do not re-punch the same id within 5 s
+#define PUNCH_REQUIRE_DIST_OK 0     // 1 = only punch in the OK distance band (enable AFTER calibrating
+                                    // DIST_K_*; otherwise the placeholder band can block all punches)
+// System clock has no RTC/NTP on this board; seed it from the build date so punches carry a
+// plausible, advancing UTC stamp. For REAL UTC, set the clock from NTP (via the C6), an external
+// RTC (e.g. DS3231), or a one-off settimeofday over serial. 2026-06-17 00:00:00 UTC:
+#define PUNCH_BASE_EPOCH 1781654400LL
+
+static volatile int g_punch_pending = 0; // 1 while a punch awaits/owns the thumbnail buffer
+static uint16_t *g_punch_thumb = nullptr; // RGB565 thumbnail (PSRAM), owned by punch when pending
+static punch_event_t g_punch = {};
+
 static inline int clampi(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -230,6 +276,22 @@ static void draw_overlays(dl::image::img_t &img)
         }
     }
 }
+
+#if DISPLAY_MIRROR_X
+/* In-place horizontal mirror of an RGB565 frame (reverse each row). */
+static inline void mirror_x_rgb565(uint8_t *buf, uint32_t w, uint32_t h)
+{
+    uint16_t *px = (uint16_t *)buf;
+    for (uint32_t y = 0; y < h; y++) {
+        uint16_t *row = px + (size_t)y * w;
+        for (uint32_t a = 0, b = w - 1; a < b; a++, b--) {
+            uint16_t t = row[a];
+            row[a] = row[b];
+            row[b] = t;
+        }
+    }
+}
+#endif
 
 /* -------- camera frame callback (runs in the capture task, core 0) -------- */
 static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t len)
@@ -292,6 +354,9 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
     };
     int64_t d0 = esp_timer_get_time();
     draw_overlays(img);
+#if DISPLAY_MIRROR_X
+    mirror_x_rgb565(buf, w, h); // flip image+overlay together for display; AI copy already taken
+#endif
     g_stats.draw_ms = (float)(esp_timer_get_time() - d0) / 1000.0f;
 
     int64_t f0 = esp_timer_get_time();
@@ -380,6 +445,34 @@ static region_stats_t analyze_region(const uint16_t *buf, int bw, int bh, int x0
     return s;
 }
 
+/* Downscale the face box region of the (BGR565) AI buffer into the RGB565 punch thumbnail,
+ * swapping R/B so the saved photo has correct colours (the live canvas keeps its cosmetic swap). */
+static void capture_punch_thumb(const uint16_t *buf, int bw, int bh, int x0, int y0, int x1, int y1)
+{
+    if (!g_punch_thumb) {
+        return;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > bw) x1 = bw;
+    if (y1 > bh) y1 = bh;
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw < 2 || rh < 2) {
+        return;
+    }
+    for (int dy = 0; dy < PUNCH_H; dy++) {
+        int sy = y0 + dy * rh / PUNCH_H;
+        const uint16_t *srow = buf + (size_t)sy * bw;
+        uint16_t *drow = g_punch_thumb + (size_t)dy * PUNCH_W;
+        for (int dx = 0; dx < PUNCH_W; dx++) {
+            int sx = x0 + dx * rw / PUNCH_W;
+            uint16_t p = srow[sx]; // BGR565: B[15:11] G[10:5] R[4:0]
+            uint16_t r = p & 0x1F, g = (p >> 5) & 0x3F, b = (p >> 11) & 0x1F;
+            drow[dx] = (uint16_t)((r << 11) | (g << 5) | b); // -> RGB565
+        }
+    }
+}
+
 #if CAM_AUTODETECT_PIX
 /* -------- one-time runtime calibration of the camera pixel format -------- */
 static void calibrate_pix(dl::image::img_t &img)
@@ -464,6 +557,7 @@ static void apply_feat_model(int idx)
     // Each recognizer keeps its OWN database file (different embedding spaces / feat_len), so
     // switching never corrupts the other model's enrollments and needs no DB reset.
     HumanFaceRecognizer *nr = new HumanFaceRecognizer(feat_db_path(idx), FEAT_MODELS[idx].type);
+    nr->set_thr(RECO_QUERY_THR); // return raw top-1 similarity; firmware decides accept
     HumanFaceRecognizer *old = g_recognizer;
     g_recognizer = nr; // AI task owns g_recognizer
     delete old;
@@ -575,6 +669,52 @@ static void ai_task(void *arg)
         // Recognition needs 5-pt landmarks; ESPDet detectors return none -> auto-disable.
         bool can_recognize = largest_ok && (int)largest_det->keypoint.size() == 10;
 
+        // --- Distance estimate + positioning guide (for ANY detected face, pre-recognition) ---
+        static float s_dist_ema = 0.0f;
+        if (largest_ok) {
+            int ipd_px = 0;
+            float size_px = 0.0f, K = DIST_K_BOX;
+            const std::vector<int> &kp = largest_det->keypoint;
+            if (kp.size() == 10) {
+                // esp-dl order [L-eye, L-mouth, nose, R-eye, R-mouth] -> eyes at flat idx 0 and 3.
+                int dx = kp[6] - kp[0], dy = kp[7] - kp[1];
+                ipd_px = (int)(sqrtf((float)(dx * dx + dy * dy)) + 0.5f);
+                if (ipd_px > 1) {
+                    size_px = (float)ipd_px;
+                    K = DIST_K_IPD;
+                }
+            }
+            if (size_px < 1.0f) { // fall back to box width
+                size_px = (float)(largest_det->box[2] - largest_det->box[0]);
+                ipd_px = 0;
+            }
+            int dist = (size_px > 1.0f) ? (int)(K / size_px) : 0;
+            if (dist > 0) {
+                s_dist_ema = (s_dist_ema > 0.0f) ? (1.0f - DIST_EMA) * s_dist_ema + DIST_EMA * dist : dist;
+                dist = ((int)(s_dist_ema + 5.0f) / 10) * 10; // smooth + round to 10 mm
+            }
+            int center = (DIST_OK_MIN_MM + DIST_OK_MAX_MM) / 2;
+            int was_ok = (g_stats.dist_guide == 1) ? DIST_HYST_MM : 0; // hysteresis: OK band sticks
+            g_stats.face_dist_mm = dist;
+            g_stats.ipd_px = ipd_px;
+            if (dist < DIST_OK_MIN_MM - was_ok) {
+                g_stats.dist_guide = 2; // too close -> move back
+                g_stats.dist_delta_mm = ((center - dist) / 10) * 10;
+            } else if (dist > DIST_OK_MAX_MM + was_ok) {
+                g_stats.dist_guide = 3; // too far -> come closer
+                g_stats.dist_delta_mm = ((dist - center) / 10) * 10;
+            } else {
+                g_stats.dist_guide = 1; // OK
+                g_stats.dist_delta_mm = 0;
+            }
+        } else {
+            g_stats.face_dist_mm = 0;
+            g_stats.dist_guide = 0;
+            g_stats.dist_delta_mm = 0;
+            g_stats.ipd_px = 0;
+            s_dist_ema = 0.0f;
+        }
+
         // --- Recognition: throttled (slow, ~200ms), only on the most prominent face ---
         if (!g_det_has_kp) {
             g_stats.rec_state = 3; // unavailable (detector has no landmarks)
@@ -584,20 +724,26 @@ static void ai_task(void *arg)
         if (can_recognize && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
             std::list<dl::detect::result_t> one = {*largest_det};
             int64_t rec0 = esp_timer_get_time();
+            // Query thr is RECO_QUERY_THR (low) -> rec[0] is the top-1 match with RAW similarity.
             std::vector<dl::recognition::result_t> rec = g_recognizer->recognize(img, one);
             g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
             g_stats.rec_state = 1; // ran this frame
             g_last_reco_us = now_us;
             g_reco_valid = true;
             if (!rec.empty()) {
-                g_reco_recognized = true;
                 g_reco_id = rec[0].id;
-                g_reco_sim = rec[0].similarity;
+                g_reco_sim = rec[0].similarity;                 // raw cosine, kept for display/log
+                g_reco_recognized = (g_reco_sim >= RECO_ACCEPT_THR); // firmware accept decision
             } else {
-                g_reco_recognized = false;
+                g_reco_recognized = false; // empty DB - nothing enrolled to match against
                 g_reco_id = -1;
                 g_reco_sim = 0.0f;
             }
+            // TAR/FAR proof: log every recognition's raw score + decision (genuine vs impostor
+            // is labelled by YOUR test protocol). Grep "VERIFY," in the monitor.
+            ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,thr=%.2f,%s,db=%d", g_stats.reco_model, g_reco_id,
+                     g_reco_sim, (double)RECO_ACCEPT_THR, g_reco_recognized ? "ACCEPT" : "REJECT",
+                     g_recognizer->get_num_feats());
         }
         // Reuse the most recent recognition result for the prominent face's box.
         if (largest_idx >= 0 && g_reco_valid && (now_us - g_last_reco_us < RECO_STICKY_US)) {
@@ -672,6 +818,37 @@ static void ai_task(void *arg)
             s_live_cx = s_live_cy = -1;
         }
 
+        // --- Attendance punch: fresh accepted match, not a suspected spoof, at a good distance ---
+        static int64_t s_last_punch_us = 0;
+        static int s_last_punch_id = -1;
+        bool accepted = (largest_idx >= 0) && local[largest_idx].recognized;
+        bool not_spoof = (g_spoof_mode == 0) || (g_stats.spoof_state != 2);
+        bool dist_ok = !PUNCH_REQUIRE_DIST_OK || (g_stats.dist_guide == 1);
+        if (accepted && not_spoof && dist_ok && !g_punch_pending) {
+            int pid = local[largest_idx].id;
+            if (pid != s_last_punch_id || (now_us - s_last_punch_us > PUNCH_DEBOUNCE_US)) {
+                s_last_punch_us = now_us;
+                s_last_punch_id = pid;
+                // Thumbnail from the crop (box is in crop coords -> indexes g_ai_buf directly).
+                capture_punch_thumb((const uint16_t *)g_ai_buf, aw, ah, largest_det->box[0],
+                                    largest_det->box[1], largest_det->box[2], largest_det->box[3]);
+                g_punch.id = pid;
+                g_punch.sim = local[largest_idx].sim;
+                g_punch.dist_mm = g_stats.face_dist_mm;
+                g_punch.epoch = (long long)time(nullptr);
+                g_punch.thumb_w = PUNCH_W;
+                g_punch.thumb_h = PUNCH_H;
+                g_punch_pending = 1; // hand off to UI; MUST be the last write (ownership flag)
+                char ts[24];
+                struct tm tmv;
+                time_t e = (time_t)g_punch.epoch;
+                gmtime_r(&e, &tmv);
+                strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+                ESP_LOGI("PUNCH", "id=%d,sim=%.2f,dist=%dmm,utc=%s", pid, (double)g_punch.sim,
+                         g_punch.dist_mm, ts);
+            }
+        }
+
         // Publish results for the display overlay.
         if (xSemaphoreTake(g_results_mtx, portMAX_DELAY) == pdTRUE) {
             memcpy(g_results, local, sizeof(FaceBox) * n);
@@ -688,7 +865,8 @@ static void ai_task(void *arg)
             snprintf(status, sizeof(status), "Faces: %d    ID %d  (%.2f)    DB: %d",
                      n, local[show].id, local[show].sim, db_count);
         } else {
-            snprintf(status, sizeof(status), "Faces: %d    unknown    DB: %d", n, db_count);
+            snprintf(status, sizeof(status), "Faces: %d    unknown (best %.2f)    DB: %d", n,
+                     local[show].sim, db_count);
         }
         ui_set_status(status);
 
@@ -793,6 +971,21 @@ esp_err_t face_processor_init(const char *db_path)
         return ESP_ERR_NO_MEM;
     }
 
+    g_punch_thumb = (uint16_t *)heap_caps_malloc(PUNCH_W * PUNCH_H * 2, MALLOC_CAP_SPIRAM);
+    if (!g_punch_thumb) {
+        ESP_LOGW(TAG, "no PSRAM for punch thumbnail; punch photo disabled");
+    }
+
+    // No RTC/NTP on this board: seed the clock from the build-date epoch so punch timestamps are
+    // plausible + advancing. Replace with NTP (C6) / external RTC / serial settimeofday for real UTC.
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    if (tv.tv_sec < PUNCH_BASE_EPOCH) {
+        tv.tv_sec = PUNCH_BASE_EPOCH;
+        tv.tv_usec = 0;
+        settimeofday(&tv, nullptr);
+    }
+
     // Per-model face DBs live in the directory of the db_path app_main provided.
     {
         const char *slash = strrchr(db_path, '/');
@@ -811,6 +1004,7 @@ esp_err_t face_processor_init(const char *db_path)
         g_detect->set_score_thr(DETECT_SCORE_THR, 1);
     }
     g_recognizer = new HumanFaceRecognizer(feat_db_path(g_feat_model_idx), FEAT_MODELS[g_feat_model_idx].type);
+    g_recognizer->set_thr(RECO_QUERY_THR); // return raw top-1 similarity; firmware decides accept
     ESP_LOGI(TAG, "models created, recognizer DB '%s' has %d face(s)", FEAT_MODELS[g_feat_model_idx].db_file,
              g_recognizer->get_num_feats());
 
@@ -829,6 +1023,9 @@ esp_err_t face_processor_init(const char *db_path)
 
     ESP_LOGI("BENCH", "columns: detector,input,recognizer,featlen,range,fps,cap_ms,det_ms,rec_ms,"
                       "draw_ms,disp_ms,load0%%,load1%%,faces,db,int_free,psram_free,luma,sat%%,spoof");
+    ESP_LOGI("VERIFY", "columns: recognizer,id,sim(raw cosine),accept_thr,decision,db_count "
+                       "| genuine=same enrolled person, impostor=different person; TAR=accepts/genuine, "
+                       "FAR=accepts/impostor at accept_thr");
 
     detect_selftest();  // forces the (lazy) detector load so requery can read the input tensor
     requery_det_info(); // input resolution + name + keypoint capability
@@ -862,6 +1059,25 @@ void face_processor_get_stats(pipeline_stats_t *out)
     if (out) {
         *out = g_stats; // scalar fields; a torn snapshot is cosmetically harmless
     }
+}
+
+int face_processor_get_punch(punch_event_t *out, const uint16_t **thumb)
+{
+    if (!g_punch_pending) {
+        return 0;
+    }
+    if (out) {
+        *out = g_punch;
+    }
+    if (thumb) {
+        *thumb = g_punch_thumb;
+    }
+    return 1;
+}
+
+void face_processor_punch_consumed(void)
+{
+    g_punch_pending = 0; // release the thumbnail buffer; the AI task may refill on the next punch
 }
 
 void face_processor_cycle_range(void)

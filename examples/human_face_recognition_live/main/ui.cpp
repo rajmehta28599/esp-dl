@@ -6,6 +6,8 @@
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
 
+#include <time.h>
+
 static const char *TAG = "ui";
 
 static lv_obj_t *s_canvas = nullptr;
@@ -17,6 +19,17 @@ static lv_obj_t *s_range_lbl = nullptr;    // RANGE button caption
 static lv_obj_t *s_det_lbl = nullptr;      // DET (detector model) button caption
 static lv_obj_t *s_rec_lbl = nullptr;      // REC (recognizer model) button caption
 static lv_obj_t *s_spoof_lbl = nullptr;    // SPOOF (mode) button caption
+
+// Punch (attendance) card: profile snapshot + id + UTC time, shown briefly on a fresh match.
+static lv_obj_t *s_punch_card = nullptr;
+static lv_obj_t *s_punch_img = nullptr;
+static lv_obj_t *s_punch_id = nullptr;
+static lv_obj_t *s_punch_time = nullptr;
+static lv_obj_t *s_punch_dist = nullptr;
+static lv_img_dsc_t s_punch_dsc;       // points at the punch thumbnail buffer
+static bool s_card_showing = false;
+static uint32_t s_card_since = 0;
+#define PUNCH_CARD_MS 4000
 
 static void style_text_panel(lv_obj_t *label, lv_opa_t bg_opa)
 {
@@ -124,7 +137,7 @@ static void stats_timer_cb(lv_timer_t *timer)
     unsigned st_used = (s.store_total - s.store_free) / 1024, st_tot = s.store_total / 1024;
 
     // Colour-coded fragments (label has recolor enabled): green ok, yellow caution, red alert.
-    static char c0[28], c1[28], recln[72], livln[48], lightln[40];
+    static char c0[28], c1[28], recln[72], livln[48], lightln[40], posln[56];
     snprintf(c0, sizeof(c0), "#%s %.0f%%#", s.load_core0 > 90 ? "ff5555" : "66ff66", s.load_core0);
     snprintf(c1, sizeof(c1), "#%s %.0f%%#", s.load_core1 > 90 ? "ff5555" : "66ff66", s.load_core1);
     if (s.rec_state == 3) {
@@ -142,6 +155,15 @@ static void stats_timer_cb(lv_timer_t *timer)
     }
     snprintf(lightln, sizeof(lightln), "%s",
              s.glare ? "#ff5555 GLARE#" : (s.bright ? "#ffcc33 BRIGHT#" : "#66ff66 OK#"));
+    if (s.dist_guide == 0) {
+        snprintf(posln, sizeof(posln), "no face");
+    } else if (s.dist_guide == 1) {
+        snprintf(posln, sizeof(posln), "%d mm  #66ff66 OK hold#", s.face_dist_mm);
+    } else if (s.dist_guide == 2) {
+        snprintf(posln, sizeof(posln), "%d mm  #ffcc33 BACK %d mm#", s.face_dist_mm, s.dist_delta_mm);
+    } else {
+        snprintf(posln, sizeof(posln), "%d mm  #ffcc33 CLOSER %d mm#", s.face_dist_mm, s.dist_delta_mm);
+    }
 
     static char buf[1100];
     snprintf(buf, sizeof(buf),
@@ -166,12 +188,14 @@ static void stats_timer_cb(lv_timer_t *timer)
              "Faces %d / ~%d max\n"
              "%u/%u KB used\n"
              "#22ddff LIGHT#\n"
-             "luma %.0f  sat %.0f%%  %s",
+             "luma %.0f  sat %.0f%%  %s\n"
+             "#22ddff POSITION#  ipd %d px\n"
+             "%s",
              s.fps, s.cap_ms, cap_hz, s.copy_ms, s.det_ms, det_hz, recln, s.draw_ms, s.disp_ms, c0, c1,
              s.model_loc, s.det_model, s.model_in_w, s.model_in_h, s.reco_model, s.feat_len, s.feat_params,
              s.feat_gflops, s.feat_tar, face_processor_spoof_name(), livln, int_free, int_tot, int_pct,
              ps_free, ps_tot, ps_pct, s.db_count, s.db_capacity, st_used, st_tot, s.mean_luma,
-             s.sat_frac * 100.0f, lightln);
+             s.sat_frac * 100.0f, lightln, s.ipd_px, posln);
     lv_label_set_text(s_stats_label, buf);
 
     // Warning banner: strongest condition wins (spoof > glare > bright).
@@ -191,6 +215,45 @@ static void stats_timer_cb(lv_timer_t *timer)
             lv_obj_clear_flag(s_warn_label, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(s_warn_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Punch card: rising-edge show, auto-hide after PUNCH_CARD_MS. The thumbnail buffer stays
+    // owned by the punch (face_processor won't refill it) until we call punch_consumed() on hide.
+    if (s_punch_card) {
+        if (!s_card_showing) {
+            punch_event_t p;
+            const uint16_t *thumb = nullptr;
+            if (face_processor_get_punch(&p, &thumb) && thumb) {
+                s_punch_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+                s_punch_dsc.header.always_zero = 0;
+                s_punch_dsc.header.w = p.thumb_w;
+                s_punch_dsc.header.h = p.thumb_h;
+                s_punch_dsc.data_size = (uint32_t)p.thumb_w * p.thumb_h * 2;
+                s_punch_dsc.data = (const uint8_t *)thumb;
+                lv_img_set_src(s_punch_img, &s_punch_dsc);
+
+                char b[48];
+                snprintf(b, sizeof(b), "ID %d    sim %.2f", p.id, p.sim);
+                lv_label_set_text(s_punch_id, b);
+                time_t e = (time_t)p.epoch;
+                struct tm tmv;
+                gmtime_r(&e, &tmv);
+                char ts[40];
+                strftime(ts, sizeof(ts), "%Y-%m-%d  %H:%M:%S UTC", &tmv);
+                lv_label_set_text(s_punch_time, ts);
+                snprintf(b, sizeof(b), "Distance %d mm", p.dist_mm);
+                lv_label_set_text(s_punch_dist, b);
+
+                lv_obj_clear_flag(s_punch_card, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(s_punch_card);
+                s_card_showing = true;
+                s_card_since = lv_tick_get();
+            }
+        } else if (lv_tick_elaps(s_card_since) > PUNCH_CARD_MS) {
+            lv_obj_add_flag(s_punch_card, LV_OBJ_FLAG_HIDDEN);
+            s_card_showing = false;
+            face_processor_punch_consumed(); // release the thumbnail only now the card is done
         }
     }
 }
@@ -255,6 +318,46 @@ void ui_init(void)
     s_rec_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 224, -10, rec_btn_cb);
     snprintf(b, sizeof(b), "SPF:%s", face_processor_spoof_name());
     s_spoof_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 436, -10, spoof_btn_cb);
+
+    // Punch (attendance) card - centred, hidden until a fresh match. Snapshot + id + UTC time.
+    s_punch_card = lv_obj_create(scr);
+    lv_obj_set_size(s_punch_card, 300, 296);
+    lv_obj_align(s_punch_card, LV_ALIGN_CENTER, 0, -16);
+    lv_obj_set_style_bg_color(s_punch_card, lv_color_hex(0x0e2a16), 0);
+    lv_obj_set_style_bg_opa(s_punch_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_punch_card, lv_color_hex(0x33ff88), 0);
+    lv_obj_set_style_border_width(s_punch_card, 3, 0);
+    lv_obj_set_style_radius(s_punch_card, 10, 0);
+    lv_obj_clear_flag(s_punch_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *phdr = lv_label_create(s_punch_card);
+    lv_label_set_text(phdr, LV_SYMBOL_OK " PUNCH");
+    lv_obj_set_style_text_color(phdr, lv_color_hex(0x66ff99), 0);
+    lv_obj_set_style_text_font(phdr, &lv_font_montserrat_24, 0);
+    lv_obj_align(phdr, LV_ALIGN_TOP_MID, 0, 0);
+
+    s_punch_img = lv_img_create(s_punch_card);
+    lv_obj_align(s_punch_img, LV_ALIGN_TOP_MID, 0, 36);
+
+    s_punch_id = lv_label_create(s_punch_card);
+    lv_obj_set_style_text_color(s_punch_id, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_punch_id, &lv_font_montserrat_20, 0);
+    lv_obj_align(s_punch_id, LV_ALIGN_TOP_MID, 0, 146);
+    lv_label_set_text(s_punch_id, "");
+
+    s_punch_time = lv_label_create(s_punch_card);
+    lv_obj_set_style_text_color(s_punch_time, lv_color_hex(0xcfe8ff), 0);
+    lv_obj_set_style_text_font(s_punch_time, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_punch_time, LV_ALIGN_TOP_MID, 0, 178);
+    lv_label_set_text(s_punch_time, "");
+
+    s_punch_dist = lv_label_create(s_punch_card);
+    lv_obj_set_style_text_color(s_punch_dist, lv_color_hex(0xcfe8ff), 0);
+    lv_obj_set_style_text_font(s_punch_dist, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_punch_dist, LV_ALIGN_TOP_MID, 0, 204);
+    lv_label_set_text(s_punch_dist, "");
+
+    lv_obj_add_flag(s_punch_card, LV_OBJ_FLAG_HIDDEN);
 
     lvgl_port_unlock();
     ESP_LOGI(TAG, "UI initialized");

@@ -52,4 +52,11 @@ public:
     esp_err_t delete_last_feat();
     int get_num_feats();
     HumanFaceFeat *get_feat_model();
+
+    // Query threshold control. Set to a low value (e.g. -1) to make recognize() always
+    // return the top-1 match with its RAW cosine similarity, so the caller can apply its
+    // own accept threshold and log genuine/impostor scores for TAR/FAR measurement.
+    void set_thr(float thr) { m_thr = thr; }
+    float get_thr() { return m_thr; }
+    void set_top_k(int k) { m_top_k = k; }
 };
