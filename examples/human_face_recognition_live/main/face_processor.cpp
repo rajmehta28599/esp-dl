@@ -943,29 +943,40 @@ static void ai_task(void *arg)
             g_stats.rec_state = largest_ok ? 2 : 0; // 2 = face present, waiting for window
         }
         if (can_recognize && !g_enroll_active && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
-            // Probe quality gate (cheap): skip blurry / oblique / blown probes so a bad frame cannot
-            // flip the decision. Only pay the ~165 ms feature extraction on a good frame.
-            face_quality_t pq = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
-            if (pq.ok) {
-                int64_t rec0 = esp_timer_get_time();
-                std::vector<float> probe;
-                if (extract_feat(img, *largest_det, probe)) {
-                    PersonDB::MatchResult m = g_persons.match(probe.data());
-                    g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
-                    g_stats.rec_state = 1; // ran this frame
-                    g_last_reco_us = now_us;
-                    g_reco_valid = true;
-                    g_reco_id = m.person_id;
-                    g_reco_sim = m.sim;                                  // fused raw cosine, kept for log
-                    g_reco_recognized = (m.person_id > 0 && m.sim >= RECO_ACCEPT_THR);
-                    vote_push(g_reco_recognized ? m.person_id : -1);
-                    // TAR/FAR proof: raw score + decision per recognition. Grep "VERIFY," in the monitor.
-                    ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,thr=%.2f,%s,db=%d", g_stats.reco_model,
-                             g_reco_id, g_reco_sim, (double)RECO_ACCEPT_THR,
-                             g_reco_recognized ? "ACCEPT" : "REJECT", g_persons.num_templates());
+            if (g_persons.num_persons() == 0) {
+                // Empty DB: nothing to match against -> skip the costly ~165-320 ms extraction entirely.
+                g_last_reco_us = now_us;
+                g_stats.rec_ms = 0.0f;
+                g_stats.rec_state = 2; // face present, but DB empty -> tap ENROLL first
+                g_reco_valid = true;
+                g_reco_recognized = false;
+                g_reco_id = -1;
+                g_reco_sim = 0.0f;
+            } else {
+                // Probe quality gate (cheap): skip blurry / oblique / blown probes so a bad frame
+                // cannot flip the decision. Only pay the feature extraction on a good frame.
+                face_quality_t pq = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
+                if (pq.ok) {
+                    int64_t rec0 = esp_timer_get_time();
+                    std::vector<float> probe;
+                    if (extract_feat(img, *largest_det, probe)) {
+                        PersonDB::MatchResult m = g_persons.match(probe.data());
+                        g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
+                        g_stats.rec_state = 1; // ran this frame
+                        g_last_reco_us = now_us;
+                        g_reco_valid = true;
+                        g_reco_id = m.person_id;
+                        g_reco_sim = m.sim;                              // fused raw cosine, kept for log
+                        g_reco_recognized = (m.person_id > 0 && m.sim >= RECO_ACCEPT_THR);
+                        vote_push(g_reco_recognized ? m.person_id : -1);
+                        // TAR/FAR proof: raw score + decision per recognition. Grep "VERIFY," in monitor.
+                        ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,thr=%.2f,%s,db=%d", g_stats.reco_model,
+                                 g_reco_id, g_reco_sim, (double)RECO_ACCEPT_THR,
+                                 g_reco_recognized ? "ACCEPT" : "REJECT", g_persons.num_templates());
+                    }
                 }
+                // else: poor probe quality -> leave rec_state at 2 (waiting) and keep sticky result.
             }
-            // else: poor probe quality -> leave rec_state at 2 (waiting) and keep the sticky result.
         }
         // Reuse the most recent recognition result for the prominent face's box.
         if (largest_idx >= 0 && g_reco_valid && (now_us - g_last_reco_us < RECO_STICKY_US)) {
