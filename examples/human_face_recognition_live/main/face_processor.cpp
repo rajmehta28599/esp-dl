@@ -217,6 +217,12 @@ static bool g_pix_locked = true;
 // for the boxes in between. This keeps box tracking smooth (~detection rate).
 #define RECOGNIZE_INTERVAL_US 450000 // ~2 Hz
 #define RECO_STICKY_US 2000000       // keep the last recognition on the box for up to 2s
+// Detection throttle: run the detector on every Nth AI frame and reuse the last boxes for the
+// overlay in between. At ~7 fps a face barely moves between frames, so this ~halves the detector's
+// core-1 duty (YuNet ~90 ms) and frees headroom for recognition. Recognition + enroll are gated to
+// the frames where detection actually ran, so they always align on FRESH keypoints (a stale box
+// would degrade the 5-pt alignment). 1 = every frame (old behaviour).
+#define DET_EVERY_N 2
 
 // TAR/FAR measurement: the recognizer's query threshold is set very low so recognize() always
 // returns the top-1 match with its RAW cosine similarity; the firmware then accepts at
@@ -864,10 +870,19 @@ static void ai_task(void *arg)
         }
         img.pix_type = g_infer_pix;
 #endif
-        // --- Detection: runs every frame (cheap, ~40ms) ---
-        int64_t det0 = esp_timer_get_time();
-        std::list<dl::detect::result_t> &dets = g_detect->run(img);
-        g_stats.det_ms = (float)(esp_timer_get_time() - det0) / 1000.0f;
+        // --- Detection: throttled to every DET_EVERY_N-th AI frame (see DET_EVERY_N) ---
+        // On run frames we copy the result list out (run() returns a ref to the detector's internal
+        // storage); on skip frames we reuse that copy so the overlay still tracks. det_ran gates the
+        // recognition + enroll paths below to fresh keypoints.
+        static uint32_t s_ai_frame = 0;
+        static std::list<dl::detect::result_t> s_dets_cache;
+        bool det_ran = (s_ai_frame++ % DET_EVERY_N) == 0;
+        if (det_ran) {
+            int64_t det0 = esp_timer_get_time();
+            s_dets_cache = g_detect->run(img);
+            g_stats.det_ms = (float)(esp_timer_get_time() - det0) / 1000.0f;
+        }
+        std::list<dl::detect::result_t> &dets = s_dets_cache;
 
         FaceBox local[MAX_FACES];
         int n = 0;
@@ -963,7 +978,7 @@ static void ai_task(void *arg)
         } else {
             g_stats.rec_state = largest_ok ? 2 : 0; // 2 = face present, waiting for window
         }
-        if (can_recognize && !g_enroll_active && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
+        if (det_ran && can_recognize && !g_enroll_active && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
             if (g_persons.num_persons() == 0) {
                 // Empty DB: nothing to match against -> skip the costly ~165-320 ms extraction entirely.
                 g_last_reco_us = now_us;
@@ -1033,7 +1048,7 @@ static void ai_task(void *arg)
         }
         // While active: collect the best quality-passing frames (>=ENROLL_MIN_GAP_US apart), then commit.
         if (g_enroll_active) {
-            if (can_recognize && (now_us - g_enroll_last_cap_us > ENROLL_MIN_GAP_US)) {
+            if (det_ran && can_recognize && (now_us - g_enroll_last_cap_us > ENROLL_MIN_GAP_US)) {
                 face_quality_t q = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
                 // Calibration aid: grep "ENROLL," to see real quality numbers and tune the Q_* gates.
                 ESP_LOGI("ENROLL", "frame sharp=%.1f frontal=%.2f w=%d tw=%d sat=%.2f -> %s", q.sharp,
