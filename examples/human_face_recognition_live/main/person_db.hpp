@@ -30,6 +30,11 @@ public:
         int person_id;   // matched person id (>=1), or -1 if no match / empty db
         float sim;       // fused cosine similarity (max over that person's templates), raw
         int templates;   // number of templates the matched person has
+        int second_id;   // runner-up person id, or -1 if the db has <2 people
+        float second_sim; // runner-up's fused cosine, or -1 if no runner-up. The top1-vs-top2
+                          // gap (sim - second_sim) is the decision margin: a small gap means the
+                          // probe is nearly equidistant to two identities -> reject as ambiguous
+                          // rather than risk a confident WRONG id (the id1<->id2 cross-match bug).
     };
 
     PersonDB() = default;

@@ -223,7 +223,18 @@ static bool g_pix_locked = true;
 // RECO_ACCEPT_THR and logs every score (VERIFY,...) so genuine vs impostor distributions can be
 // built on-device. Raise/lower RECO_ACCEPT_THR to trade TAR vs FAR.
 #define RECO_QUERY_THR -1.0f
-#define RECO_ACCEPT_THR 0.5f
+// INTERIM values (Test 005) — calibrate from a clean cross-person run; do NOT treat as final.
+// 0.50 was far too permissive: these int8 face models (MFN/MBF) quote 90-94% TAR at FAR=1e-4,
+// an operating point well ABOVE 0.50, so impostors routinely clear 0.50 -> unenrolled faces and
+// other people were accepted as id1 (open-set false accept). 0.62 is a precision-leaning interim
+// (payroll: a WRONG punch is worse than a re-scan); temporal voting + multiple frames recover the
+// occasional genuine dip below it.
+#define RECO_ACCEPT_THR 0.62f
+// Top-1 must beat the runner-up identity by this cosine margin, else the frame is rejected as
+// AMBIGUOUS instead of emitting a confident wrong id. This is what fixes the id1<->id2/id3
+// cross-match: when a probe sits between two enrolled people, neither wins. Auto-passes when the
+// DB has <2 people (no runner-up -> open-set is gated by RECO_ACCEPT_THR alone).
+#define RECO_MARGIN 0.06f
 
 /* ---- Enrollment quality gating + multi-template (Phase 1 accuracy) ----------
  * BENCHMARK_REPORT.md finding #1: a single bad enroll frame silently breaks recognition
@@ -977,12 +988,20 @@ static void ai_task(void *arg)
                         g_reco_valid = true;
                         g_reco_id = m.person_id;
                         g_reco_sim = m.sim;                              // fused raw cosine, kept for log
-                        g_reco_recognized = (m.person_id > 0 && m.sim >= RECO_ACCEPT_THR);
+                        // Accept only if the top-1 clears the absolute threshold AND beats the
+                        // runner-up identity by RECO_MARGIN (margin auto-passes when no runner-up).
+                        float margin = (m.second_sim < 0.0f) ? 99.0f : (m.sim - m.second_sim);
+                        g_reco_recognized =
+                            (m.person_id > 0 && m.sim >= RECO_ACCEPT_THR && margin >= RECO_MARGIN);
                         vote_push(g_reco_recognized ? m.person_id : -1);
-                        // TAR/FAR proof: raw score + decision per recognition. Grep "VERIFY," in monitor.
-                        ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,thr=%.2f,%s,db=%d", g_stats.reco_model,
-                                 g_reco_id, g_reco_sim, (double)RECO_ACCEPT_THR,
-                                 g_reco_recognized ? "ACCEPT" : "REJECT", g_persons.num_templates());
+                        // TAR/FAR proof + margin calibration: top-1, runner-up, and gap per frame.
+                        // Grep "VERIFY," in monitor. Genuine should show a CLEAR gap to 2nd; an
+                        // impostor/cross-match shows top-1 ~= 2nd (small margin -> now REJECTed).
+                        ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,2nd=%d/%.4f,margin=%.4f,thr=%.2f,mgn=%.2f,%s,db=%d",
+                                 g_stats.reco_model, g_reco_id, g_reco_sim, m.second_id, m.second_sim,
+                                 (m.second_sim < 0.0f ? -1.0 : (double)margin), (double)RECO_ACCEPT_THR,
+                                 (double)RECO_MARGIN, g_reco_recognized ? "ACCEPT" : "REJECT",
+                                 g_persons.num_templates());
                     }
                 }
                 // else: poor probe quality -> leave rec_state at 2 (waiting) and keep sticky result.
@@ -1303,9 +1322,10 @@ esp_err_t face_processor_init(const char *db_path)
 
     ESP_LOGI("BENCH", "columns: detector,input,recognizer,featlen,range,fps,cap_ms,det_ms,rec_ms,"
                       "draw_ms,disp_ms,load0%%,load1%%,faces,db,int_free,psram_free,luma,sat%%,spoof");
-    ESP_LOGI("VERIFY", "columns: recognizer,id,sim(raw cosine),accept_thr,decision,db_count "
-                       "| genuine=same enrolled person, impostor=different person; TAR=accepts/genuine, "
-                       "FAR=accepts/impostor at accept_thr");
+    ESP_LOGI("VERIFY", "columns: recognizer,id,sim(raw cosine),2nd=runnerup_id/sim,margin(sim-2nd),"
+                       "accept_thr,margin_thr,decision,db_count | genuine=same enrolled person, "
+                       "impostor=different person; TAR=accepts/genuine, FAR=accepts/impostor. A genuine "
+                       "match shows a CLEAR margin to 2nd; cross-matches show sim~=2nd -> REJECT");
 
     detect_selftest();  // forces the (lazy) detector load so requery can read the input tensor
     requery_det_info(); // input resolution + name + keypoint capability

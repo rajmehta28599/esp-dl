@@ -113,23 +113,40 @@ bool PersonDB::add_template(int person_id, const float *feat)
 
 PersonDB::MatchResult PersonDB::match(const float *probe) const
 {
-    MatchResult r = {-1, 0.0f, 0};
+    MatchResult r = {-1, 0.0f, 0, -1, -1.0f};
     if (!probe || m_feat_len <= 0) {
         return r;
     }
+    // Rank persons by their fused score (max cosine over that person's templates). Track the
+    // best AND the runner-up across DIFFERENT people, so the caller can require a margin between
+    // the top-1 and top-2 identities (open-set: absolute threshold; closed-set: this margin).
+    float best = -2.0f, second = -2.0f; // below any cosine
+    int best_id = -1, second_id = -1, best_tmpl = 0;
     for (const auto &p : m_persons) {
-        float best = -1.0f; // fuse templates: nearest (max cosine) wins
+        float s_best = -2.0f; // fuse templates: nearest (max cosine) wins
         for (const float *t : p.templates) {
             float s = cosine(probe, t, m_feat_len);
-            if (s > best) {
-                best = s;
+            if (s > s_best) {
+                s_best = s;
             }
         }
-        if (best > r.sim || r.person_id < 0) {
-            r.sim = best;
-            r.person_id = p.id;
-            r.templates = (int)p.templates.size();
+        if (s_best > best) {
+            second = best; // demote the previous best to runner-up
+            second_id = best_id;
+            best = s_best;
+            best_id = p.id;
+            best_tmpl = (int)p.templates.size();
+        } else if (s_best > second) {
+            second = s_best;
+            second_id = p.id;
         }
+    }
+    if (best_id >= 0) {
+        r.person_id = best_id;
+        r.sim = best;
+        r.templates = best_tmpl;
+        r.second_id = second_id;
+        r.second_sim = (second_id >= 0) ? second : -1.0f; // -1 = no runner-up (single person)
     }
     return r;
 }
