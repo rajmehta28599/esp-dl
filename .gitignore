@@ -23,3 +23,6 @@ test_apps/esp-dl/models/*/**/*.json
 
 .DS_Store
 docs/_build/
+
+# Never commit ESP-IDF toolchain archives (multi-GB; download from Espressif instead)
+**/esp-idf-v*.zip
