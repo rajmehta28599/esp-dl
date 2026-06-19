@@ -61,7 +61,11 @@ private:
     struct Person {
         int id;
         std::string name;
-        std::vector<std::vector<float>> templates; // each: m_feat_len L2-normalised floats
+        // Each entry points to m_feat_len L2-normalised floats stored in PSRAM (heap_caps SPIRAM),
+        // so the bulk feature data does not consume scarce INTERNAL RAM as the DB scales to many
+        // people (e.g. 50 staff x 5 templates x 2 KB = 500 KB). Only the small pointer vector +
+        // metadata live on the default heap.
+        std::vector<float *> templates;
     };
     std::vector<Person> m_persons;
     std::string m_path;
@@ -70,5 +74,6 @@ private:
 
     Person *find(int person_id);
     const Person *find(int person_id) const;
+    void free_person(Person &p);                                // heap_caps_free each template
     static float cosine(const float *a, const float *b, int n); // dot product (unit vectors)
 };

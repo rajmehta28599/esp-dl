@@ -1,9 +1,11 @@
 #include "person_db.hpp"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include <cstdio>
 #include <cstring>
+#include <unistd.h> // fsync
 
 static const char *TAG = "person_db";
 
@@ -46,6 +48,16 @@ const PersonDB::Person *PersonDB::find(int person_id) const
     return nullptr;
 }
 
+void PersonDB::free_person(Person &p)
+{
+    for (float *t : p.templates) {
+        if (t) {
+            heap_caps_free(t);
+        }
+    }
+    p.templates.clear();
+}
+
 int PersonDB::num_templates() const
 {
     int n = 0;
@@ -63,6 +75,9 @@ const char *PersonDB::person_name(int person_id) const
 
 void PersonDB::clear()
 {
+    for (auto &p : m_persons) {
+        free_person(p);
+    }
     m_persons.clear();
     m_next_id = 1;
 }
@@ -86,7 +101,13 @@ bool PersonDB::add_template(int person_id, const float *feat)
         ESP_LOGW(TAG, "add_template: unknown person %d", person_id);
         return false;
     }
-    p->templates.emplace_back(feat, feat + m_feat_len);
+    float *t = (float *)heap_caps_malloc((size_t)m_feat_len * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!t) {
+        ESP_LOGE(TAG, "add_template: out of PSRAM");
+        return false;
+    }
+    memcpy(t, feat, (size_t)m_feat_len * sizeof(float));
+    p->templates.push_back(t);
     return true;
 }
 
@@ -98,8 +119,8 @@ PersonDB::MatchResult PersonDB::match(const float *probe) const
     }
     for (const auto &p : m_persons) {
         float best = -1.0f; // fuse templates: nearest (max cosine) wins
-        for (const auto &t : p.templates) {
-            float s = cosine(probe, t.data(), m_feat_len);
+        for (const float *t : p.templates) {
+            float s = cosine(probe, t, m_feat_len);
             if (s > best) {
                 best = s;
             }
@@ -117,6 +138,7 @@ bool PersonDB::remove_person(int person_id)
 {
     for (auto it = m_persons.begin(); it != m_persons.end(); ++it) {
         if (it->id == person_id) {
+            free_person(*it);
             m_persons.erase(it);
             return true;
         }
@@ -128,8 +150,7 @@ bool PersonDB::load(const std::string &path, int feat_len)
 {
     m_path = path;
     m_feat_len = feat_len;
-    m_persons.clear();
-    m_next_id = 1;
+    clear(); // frees any existing templates
 
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) {
@@ -139,10 +160,10 @@ bool PersonDB::load(const std::string &path, int feat_len)
 
     uint32_t magic = 0;
     uint16_t version = 0, flen = 0, next_id = 0, n_person = 0;
-    bool ok = fread(&magic, sizeof(magic), 1, f) == 1 && fread(&version, sizeof(version), 1, f) == 1 &&
-              fread(&flen, sizeof(flen), 1, f) == 1 && fread(&next_id, sizeof(next_id), 1, f) == 1 &&
-              fread(&n_person, sizeof(n_person), 1, f) == 1;
-    if (!ok || magic != PDB_MAGIC || version != PDB_VERSION || flen != (uint16_t)feat_len) {
+    bool hdr = fread(&magic, sizeof(magic), 1, f) == 1 && fread(&version, sizeof(version), 1, f) == 1 &&
+               fread(&flen, sizeof(flen), 1, f) == 1 && fread(&next_id, sizeof(next_id), 1, f) == 1 &&
+               fread(&n_person, sizeof(n_person), 1, f) == 1;
+    if (!hdr || magic != PDB_MAGIC || version != PDB_VERSION || flen != (uint16_t)feat_len) {
         ESP_LOGW(TAG, "db header mismatch (magic/ver/feat_len) at %s; starting empty", path.c_str());
         fclose(f);
         return false;
@@ -170,15 +191,22 @@ bool PersonDB::load(const std::string &path, int feat_len)
             corrupt = true;
             break;
         }
-        for (int t = 0; t < n_tmpl; t++) {
-            std::vector<float> v(feat_len);
-            if ((int)fread(v.data(), sizeof(float), feat_len, f) != feat_len) {
+        for (int t = 0; t < n_tmpl && !corrupt; t++) {
+            float *buf = (float *)heap_caps_malloc((size_t)feat_len * sizeof(float), MALLOC_CAP_SPIRAM);
+            if (!buf) {
+                ESP_LOGE(TAG, "load: out of PSRAM");
                 corrupt = true;
                 break;
             }
-            p.templates.push_back(std::move(v));
+            if ((int)fread(buf, sizeof(float), feat_len, f) != feat_len) {
+                heap_caps_free(buf);
+                corrupt = true;
+                break;
+            }
+            p.templates.push_back(buf);
         }
         if (corrupt) {
+            free_person(p); // release this partial person's PSRAM
             break;
         }
         if (id >= m_next_id) {
@@ -189,8 +217,7 @@ bool PersonDB::load(const std::string &path, int feat_len)
     fclose(f);
     if (corrupt) {
         ESP_LOGE(TAG, "db corrupt at %s; starting empty", path.c_str());
-        m_persons.clear();
-        m_next_id = 1;
+        clear();
         return false;
     }
     ESP_LOGI(TAG, "loaded %d person(s), %d template(s) from %s", num_persons(), num_templates(),
@@ -225,12 +252,19 @@ bool PersonDB::save() const
             ok = fwrite(p.name.data(), 1, name_len, f) == name_len;
         }
         ok = ok && fwrite(&n_tmpl, sizeof(n_tmpl), 1, f) == 1;
-        for (const auto &t : p.templates) {
+        for (const float *t : p.templates) {
             if (!ok) {
                 break;
             }
-            ok = (int)fwrite(t.data(), sizeof(float), m_feat_len, f) == m_feat_len;
+            ok = (int)fwrite(t, sizeof(float), m_feat_len, f) == m_feat_len;
         }
+    }
+    if (ok) {
+        // Force FATFS to commit data + FAT + directory entry to flash NOW. Without this, fclose()
+        // only flushes the C stream; a power-cycle before the FAT cache is synced loses or
+        // cross-links the file (observed: enrollments reloading empty/corrupted after a power-cycle).
+        fflush(f);
+        fsync(fileno(f));
     }
     fclose(f);
     if (!ok) {

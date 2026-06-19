@@ -240,6 +240,11 @@ static bool g_pix_locked = true;
 #define Q_MIN_SHARP 3.0f           // gentle focus floor; sharpness mainly RANKS enroll frames, not gates
 #define Q_MIN_FRONTAL 0.50f        // 0..1 frontality from the 5 landmarks (1 = head-on); geometry-based
 #define Q_MAX_SAT 0.25f            // reject faces this blown-out (screen glare / overexposed)
+// Min face width AS SEEN BY THE DETECTOR INPUT TENSOR (px), = box_w * model_in_w / crop_w. This
+// captures the range-crop -> tensor downscale: in Wide/Full the face shrinks in the tensor, landmarks
+// get coarse, alignment degrades and the genuine person false-rejects (TEST_LOG Test 002, esp.
+// YuNet+MFN). Gating small tensor-faces eliminates those false rejects (come closer / use Tight).
+#define Q_MIN_TENSOR_FACE_W 50
 
 /* ---- Temporal voting before a punch -----------------------------------------
  * Require the same person to win K of the last M recognitions before firing a PUNCH. This
@@ -556,6 +561,7 @@ static bool extract_feat(dl::image::img_t &img, const dl::detect::result_t &det,
 // Face quality used to gate both enrollment and probe frames.
 struct face_quality_t {
     int width;
+    int tensor_w;  // face width as seen by the detector input tensor (box_w * model_in_w / crop_w)
     float det_score;
     float sharp;   // mean |Laplacian| over the face ROI (higher = sharper / in focus)
     float frontal; // 0..1 from the 5 landmarks (1 = head-on)
@@ -565,12 +571,15 @@ struct face_quality_t {
 
 static face_quality_t score_face(const uint16_t *buf, int bw, int bh, const dl::detect::result_t &det)
 {
-    face_quality_t q = {0, 0.0f, 0.0f, 0.0f, 0.0f, false};
+    face_quality_t q = {0, 0, 0.0f, 0.0f, 0.0f, 0.0f, false};
     if (det.box.size() < 4) {
         return q;
     }
     int x0 = det.box[0], y0 = det.box[1], x1 = det.box[2], y1 = det.box[3];
     q.width = x1 - x0;
+    // Face size in the detector INPUT tensor (accounts for the range-crop -> input resize). bw is the
+    // crop width fed to the detector; g_stats.model_in_w is the detector input width.
+    q.tensor_w = (g_stats.model_in_w > 0 && bw > 0) ? q.width * g_stats.model_in_w / bw : q.width;
     q.det_score = det.score;
     if (x0 < 1) x0 = 1;
     if (y0 < 1) y0 = 1;
@@ -612,8 +621,9 @@ static face_quality_t score_face(const uint16_t *buf, int bw, int bh, const dl::
         }
     }
 
-    q.ok = q.width >= MIN_FACE_WIDTH && q.det_score >= Q_MIN_DET_SCORE && q.sharp >= Q_MIN_SHARP &&
-           q.frontal >= Q_MIN_FRONTAL && q.sat <= Q_MAX_SAT;
+    q.ok = q.width >= MIN_FACE_WIDTH && q.tensor_w >= Q_MIN_TENSOR_FACE_W &&
+           q.det_score >= Q_MIN_DET_SCORE && q.sharp >= Q_MIN_SHARP && q.frontal >= Q_MIN_FRONTAL &&
+           q.sat <= Q_MAX_SAT;
     return q;
 }
 
@@ -1004,8 +1014,8 @@ static void ai_task(void *arg)
             if (can_recognize && (now_us - g_enroll_last_cap_us > ENROLL_MIN_GAP_US)) {
                 face_quality_t q = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
                 // Calibration aid: grep "ENROLL," to see real quality numbers and tune the Q_* gates.
-                ESP_LOGI("ENROLL", "frame sharp=%.1f frontal=%.2f w=%d sat=%.2f -> %s", q.sharp, q.frontal,
-                         q.width, q.sat, q.ok ? "keep" : "skip");
+                ESP_LOGI("ENROLL", "frame sharp=%.1f frontal=%.2f w=%d tw=%d sat=%.2f -> %s", q.sharp,
+                         q.frontal, q.width, q.tensor_w, q.sat, q.ok ? "keep" : "skip");
                 if (q.ok) {
                     std::vector<float> feat;
                     if (extract_feat(img, *largest_det, feat)) {
