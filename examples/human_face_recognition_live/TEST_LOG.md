@@ -14,6 +14,27 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 010 — 2026-06-19 · Speed inc 3 (mirror OFF) — first real FPS win (+20%, steady); kept
+**Build:** `v3.3.5-35-gb5ef9ce` (`DISPLAY_MIRROR_X=0`). **Result: kept.**
+| metric | inc 1 (mirror on) | inc 3 (mirror off) |
+|---|---|---|
+| FPS (YuNet+MFN) | ~7.5 (jittery) | **~9.0–9.4 (steady)** |
+| draw ms | 19–71 | **~0** (CPU mirror eliminated) |
+| disp ms | 58–129 | 60–78 |
+
+Eliminating the full-frame CPU mirror from core 0 raised FPS ~7.5→9 and removed the variance.
+**This is the GATE result the advisor wanted:** core-0 CPU-pass elimination DOES move FPS → PPA is
+*not* a downstream-bound trap, so it's worth scoping. Accuracy unchanged. Non-mirrored preview is
+cosmetic (confirm acceptable for the kiosk; if the flip is wanted, PPA can do it in hardware free).
+
+**NEXT (Monday) = Test 011, capture-ceiling probe (gate 2):** flash a throwaway build with the LCD
+flush stubbed (`DISPLAY_PROBE_NO_FLUSH=1` → early-return at the top of `ui_update_camera_canvas`,
+~2 lines) and read `fps`/`cap` = max capture+AI speed with the display removed. **If ~15–30 fps →
+PPA is worth the multi-day rewrite; if ~9–10 → capture/AI-bound, stop and pivot to the C6.** (Probe
+was built once as `-dirty` but not flashed; reverted from the tree so the keeper stays clean.)
+
+---
+
 ## Test 009 — 2026-06-19 · Speed inc 2 (async LCD flush) FAILED + reverted
 **Build:** `v3.3.5-33-gbb7d7af` (async flush ON, clean flash). **Result: regressed — reverted to
 `v3.3.5-34-g65ac208` (`DISPLAY_ASYNC_FLUSH 0`).**
