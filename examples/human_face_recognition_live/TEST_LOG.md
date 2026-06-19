@@ -14,6 +14,33 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 009 — 2026-06-19 · Speed inc 2 (async LCD flush) FAILED + reverted
+**Build:** `v3.3.5-33-gbb7d7af` (async flush ON, clean flash). **Result: regressed — reverted to
+`v3.3.5-34-g65ac208` (`DISPLAY_ASYNC_FLUSH 0`).**
+
+| metric | inc 1 (sync, v...30) | inc 2 (async, v...33) |
+|---|---|---|
+| FPS (YuNet+MFN) | ~7.5 (steady) | **6.5–7.7, erratic** |
+| `cap` ms | 96–174 | **56–272 (bimodal)** |
+| `disp` ms | 58–129 | 18–30 (flush left the path) |
+| `draw` ms | 19–71 | **spikes 100–154** |
+| PSRAM free | 12.0 MB | 9.6 MB (2 display buffers) |
+
+**Why it failed:** moving the flush off `lv_refr_now` made the esp_lvgl_port render task (affinity −1) do
+the ~80 ms full-screen render + CPU byte-swap **asynchronously — and it floats onto core 0**, preempting the
+capture task (that's the `draw` 100–150 ms spikes + bimodal `cap`). Async **relocates** the render; it doesn't
+**eliminate** it, and on this 2-busy-core layout (core0=capture, core1=AI) there's no idle core to absorb it.
+Accuracy stayed clean (genuine 0.85–0.96, `2nd` ~0.25–0.34).
+
+**Conclusion: FPS is architecturally capped ~7–8 by the display path.** The only lever that lifts it is a
+**PPA hardware composite** (byte-swap/mirror/blit in silicon → work eliminated) — a multi-day, panel-blind
+rewrite (LVGL demoted to chrome-only). Core-affinity pinning won't help (core 1 can't absorb the render without
+starving the AI). **inc 1 was still a genuine win** (core1 68–95% → 40–48%). Decision deferred to user: PPA
+rewrite vs accept ~7–8 fps (adequate for an attendance kiosk) vs redirect effort to C6 connectivity.
+Free probe available: `DISPLAY_MIRROR_X 0` removes a ~20 ms/frame CPU mirror (cosmetic selfie flip) → ~7→8 fps.
+
+---
+
 ## Test 008 — 2026-06-19 · Speed inc 1 (detection throttle) — core-1 freed; benchmark table
 **Build:** `v3.3.5-30-g6658b62` (DET_EVERY_N=2). Flashed clean. **Result: core 1 freed as predicted, FPS
 unchanged (display-bound, expected), accuracy intact** (YuNet+MFN genuine 0.87–0.96, `2nd` 0.15–0.33; YuNet+MBF
