@@ -15,10 +15,13 @@ using namespace dl::detect;
 
 static const char *TAG = "yunet";
 
-// Embedded quantized model (main/CMakeLists EMBED_FILES "yunet_640_p4.espdl").
-extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_640_p4_espdl_start");
+// Embedded quantized model (main/CMakeLists EMBED_FILES "yunet_256x192_p4.espdl").
+extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_256x192_p4_espdl_start");
 
-#define YUNET_IN 640                       // fixed model input (square)
+// 4:3 input (matches the 4:3 camera crop -> no aspect distortion). Non-square: cols=W/s,
+// rows=H/s; grids 32x24/16x12/8x6 = 768/192/48.
+#define YUNET_W 256
+#define YUNET_H 192
 static const int STRIDES[3] = {8, 16, 32}; // anchor-free detection strides
 
 static inline float clamp01(float v)
@@ -34,7 +37,7 @@ YuNetDetect::YuNetDetect(float score_thr, float nms_thr, int top_k) :
     // YuNet wants RAW 0-255 BGR: mean 0 / std 1 => no normalization. rgb_swap=false keeps the
     // camera's BGR order. If YuNet never detects, the colour order is the first thing to flip.
     m_pre = new image::ImagePreprocessor(m_model, {0, 0, 0}, {1, 1, 1}, false);
-    ESP_LOGI(TAG, "YuNet loaded (input %dx%d)", YUNET_IN, YUNET_IN);
+    ESP_LOGI(TAG, "YuNet loaded (input %dx%d)", YUNET_W, YUNET_H);
 }
 
 YuNetDetect::~YuNetDetect()
@@ -93,7 +96,7 @@ std::list<result_t> &YuNetDetect::run(const dl::image::img_t &img)
     m_pre->preprocess(img);
     m_model->run();
 
-    // Map model(640x640) coords back to the source image (no letterbox -> border 0).
+    // Map model(256x192) coords back to the source image (no letterbox -> border 0).
     const float inv_sx = m_pre->get_resize_scale_x(true);
     const float inv_sy = m_pre->get_resize_scale_y(true);
     const int bl = m_pre->get_border_left();
@@ -101,7 +104,7 @@ std::list<result_t> &YuNetDetect::run(const dl::image::img_t &img)
 
     for (int si = 0; si < 3; si++) {
         const int s = STRIDES[si];
-        const int cols = YUNET_IN / s;
+        const int cols = YUNET_W / s; // rows = YUNET_H/s implied via num = rows*cols
         char n_cls[8], n_obj[8], n_box[8], n_kps[8];
         snprintf(n_cls, sizeof(n_cls), "cls_%d", s);
         snprintf(n_obj, sizeof(n_obj), "obj_%d", s);

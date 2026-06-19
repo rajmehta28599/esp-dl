@@ -8,4 +8,4 @@ idf_component_register(
              bsp_camera
              esp_lvgl_port
              lvgl
-    EMBED_FILES "human_face.jpg" "yunet_640_p4.espdl")
+    EMBED_FILES "human_face.jpg" "yunet_256x192_p4.espdl")
