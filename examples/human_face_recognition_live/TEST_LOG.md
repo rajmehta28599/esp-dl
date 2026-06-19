@@ -14,6 +14,32 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 007 — 2026-06-19 · YuNet alignment fix VALIDATED on-device (accuracy DONE)
+**Build:** `v3.3.5-29-gf6fe0dc` (alignment fix `aa0b124` included), flashed clean — **no checksum mismatch**,
+boots `v3.3.5-29`. (Took 3 attempts to get the fix onto the board: the `--make` monitor command only monitors,
+never flashes; then `idf.py flash` hit the stale-bootloader link error `undefined reference to rtc_clk_init` →
+fixed by deleting `build/bootloader` + `build/bootloader-prefix`; see [[idf-build-env]].) DBs CLEARED + 3 people
+re-enrolled fresh on YuNet+MFN and YuNet+MBF.
+
+**Result — alignment fix works, cross-matching GONE:**
+| combo | genuine (top-1) | cross-identity (`2nd`) | margin | vs Test 006 (broken) |
+|---|---|---|---|---|
+| YuNet+MFN | 0.85–0.97 | **0.18–0.36** | 0.5–0.77 | 2nd was 0.62–0.78 |
+| YuNet+MBF | 0.71–0.95 | **0.14–0.24** | 0.47–0.80 | 2nd was 0.76–0.86 |
+
+Cross-identity collapsed from ~0.7 to ~0.2 — **matches the MSRMNP control (Test 005, 0.12–0.25).** Every genuine
+match now beats the runner-up by a huge margin; id1 recognizes normally; no id1↔id2/id3 confusion. User confirms
+"superb working." **Root-cause fix (reorder slots by image side) is correct.** NOTE: transient REJECT streaks
+(genuine sim dips to 0.1–0.3) occur when the subject turns/blurs — that's probe robustness, not the bug; temporal
+voting still fires the PUNCH. thr 0.62 / margin 0.06 held well.
+
+**Decision:** **ACCURACY IS DONE.** Production combos = YuNet+MBF (biggest margins) or YuNet+MFN (½ the latency).
+Optional later: lower thr→~0.55 to catch the off-angle genuine dips. **Next focus (user): SPEED.** Perf baseline
+from this run (still display-bound, fps ~7): YuNet det ~90–106 ms · MFN rec ~160–175 ms · MBF rec ~320–370 ms ·
+draw ~19–65 ms · disp ~70–130 ms · load0 77–93% / load1 68–95%.
+
+---
+
 ## Test 006 — 2026-06-19 · YuNet vs MSRMNP comparison ISOLATES a YuNet alignment bug (found + fixed)
 **Build:** `v3.3.5-27-g663d73f` (same as Test 005). Ran the clean 3-person protocol on **YuNet+MFN** and
 **YuNet+MBF**, with the MSRMNP run as the control. The `2nd=` instrumentation made the cause unmistakable.

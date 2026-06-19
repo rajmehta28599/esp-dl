@@ -52,7 +52,7 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "==== CrowPanel P4 live face recognition demo ====");
 
     // 1. Mount the FAT partition that stores the face feature database.
-    ESP_ERROR_CHECK(fatfs_flash_mount());
+        ESP_ERROR_CHECK(fatfs_flash_mount());
     std::string db_path = std::string(CONFIG_SPIFLASH_MOUNT_POINT) + "/face.db";
 
     // 2. Power the MIPI DPHY (LDO3, 2.5V) and camera/peripheral rail (LDO4, 3.3V).
