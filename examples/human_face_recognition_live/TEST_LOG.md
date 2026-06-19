@@ -14,6 +14,31 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 008 — 2026-06-19 · Speed inc 1 (detection throttle) — core-1 freed; benchmark table
+**Build:** `v3.3.5-30-g6658b62` (DET_EVERY_N=2). Flashed clean. **Result: core 1 freed as predicted, FPS
+unchanged (display-bound, expected), accuracy intact** (YuNet+MFN genuine 0.87–0.96, `2nd` 0.15–0.33; YuNet+MBF
+genuine 0.66–0.94, `2nd` 0.01–0.21).
+
+**Benchmark (this build, Med range, on-device COM12):**
+| Detector | Recognizer | det (ms) | rec (ms) | draw (ms) | disp (ms) | cap (ms) | FPS | core0 % | core1 % |
+|---|---|---|---|---|---|---|---|---|---|
+| MSRMNP | MFN | 32–53 | ~160 | 20–24 | 60–98 | 99–133 | 8.0–9.7 | 85–100 | 33–43 |
+| YuNet | MFN | 90–106 | 157–197 | 19–71 | 58–129 | 96–174 | 6.8–8.7 | 77–93 | 47–74 |
+| YuNet | MBF | 89–107 | 320–372 | 15–72 | 58–131 | 94–179 | 6.5–8.7 | 66–93 | 35–91 |
+
+**Increment-1 effect (core-1 relief):**
+| Build | detection cadence | core1 % idle | core1 % recognizing |
+|---|---|---|---|
+| v3.3.5-29 (Test 007) | every AI frame | ~75–95 | 85–95 |
+| v3.3.5-30 (this) | every 2nd frame | **40–48** | **47–74 (MFN)** |
+
+**Bottleneck unchanged:** FPS ~7 is capped by core-0 (cap + disp + draw = the LVGL full-screen flush w/
+swap_bytes+sw_rotate + the mirror, all full-frame CPU passes). det/rec on core-1 now have big headroom.
+**Next:** display path (PPA composite + async flush + 3rd V4L2 buffer) is the only FPS lever — the panel-blind
+risky part. C6 CANNOT accelerate the pipeline (160 MHz single-core, no AI accel, SDIO) — it's connectivity-only.
+
+---
+
 ## Test 007 — 2026-06-19 · YuNet alignment fix VALIDATED on-device (accuracy DONE)
 **Build:** `v3.3.5-29-gf6fe0dc` (alignment fix `aa0b124` included), flashed clean — **no checksum mismatch**,
 boots `v3.3.5-29`. (Took 3 attempts to get the fix onto the board: the `--make` monitor command only monitors,
