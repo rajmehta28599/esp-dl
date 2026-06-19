@@ -372,7 +372,12 @@ void ui_init(void)
 // the capture/AI FPS rises. The ~few-ms memcpy is the only cost left on core 0 for display.
 // Tear-safe by construction: we only ever write the buffer that is NOT currently shown, and the
 // pointer swap happens under the LVGL lock (mutually exclusive with the port task's render).
-#define DISPLAY_ASYNC_FLUSH 1
+// REVERTED to 0 (Test 009): on-device this REGRESSED FPS (~7.5 -> erratic 6.5-7.7, cap jittered
+// 56-272 ms, draw spiked 100-150 ms). Root cause: the esp_lvgl_port render task has affinity -1, so
+// the ~80 ms full-screen render + CPU byte-swap floats onto core 0 and preempts capture (it just
+// RELOCATES the work; on this 2-busy-core layout there is no free core to absorb it). Only a PPA
+// hardware composite ELIMINATES that work. Kept behind the toggle for the future PPA path.
+#define DISPLAY_ASYNC_FLUSH 0
 
 void ui_update_camera_canvas(uint8_t *buf, uint32_t w, uint32_t h)
 {
