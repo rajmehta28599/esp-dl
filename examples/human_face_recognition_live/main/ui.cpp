@@ -5,8 +5,10 @@
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include <time.h>
+#include <cstring>
 
 static const char *TAG = "ui";
 
@@ -363,11 +365,41 @@ void ui_init(void)
     ESP_LOGI(TAG, "UI initialized");
 }
 
+// 1 = decouple the LCD flush from the capture task (faster); 0 = old synchronous lv_refr_now.
+// Async path: the capture task copies the finished frame into a display-owned back buffer and just
+// invalidates the canvas; the esp_lvgl_port task does the full-screen render + CPU byte-swap + DSI
+// transfer on its own 5 ms timer (off core 0). That ~60-130 ms flush no longer blocks capture, so
+// the capture/AI FPS rises. The ~few-ms memcpy is the only cost left on core 0 for display.
+// Tear-safe by construction: we only ever write the buffer that is NOT currently shown, and the
+// pointer swap happens under the LVGL lock (mutually exclusive with the port task's render).
+#define DISPLAY_ASYNC_FLUSH 1
+
 void ui_update_camera_canvas(uint8_t *buf, uint32_t w, uint32_t h)
 {
     if (!s_canvas) {
         return;
     }
+#if DISPLAY_ASYNC_FLUSH
+    static uint8_t *s_disp_buf[2] = {nullptr, nullptr};
+    static int s_disp_back = 0;
+    const size_t sz = (size_t)w * h * 2; // RGB565
+    if (!s_disp_buf[0]) {
+        s_disp_buf[0] = (uint8_t *)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+        s_disp_buf[1] = (uint8_t *)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+    }
+    if (s_disp_buf[0] && s_disp_buf[1]) {
+        uint8_t *back = s_disp_buf[s_disp_back]; // the buffer NOT currently on the canvas
+        memcpy(back, buf, sz);                   // copy out so the V4L2 buffer can recycle immediately
+        if (lvgl_port_lock(100)) {
+            lv_canvas_set_buffer(s_canvas, back, (lv_coord_t)w, (lv_coord_t)h, LV_IMG_CF_TRUE_COLOR);
+            lv_obj_invalidate(s_canvas); // port task renders on its timer; do NOT block here
+            lvgl_port_unlock();
+            s_disp_back ^= 1;
+        }
+        return;
+    }
+    // Allocation failed -> fall through to the synchronous path below.
+#endif
     if (lvgl_port_lock(100)) {
         lv_canvas_set_buffer(s_canvas, buf, (lv_coord_t)w, (lv_coord_t)h, LV_IMG_CF_TRUE_COLOR);
         lv_refr_now(NULL);
