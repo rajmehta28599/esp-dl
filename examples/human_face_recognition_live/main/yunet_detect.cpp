@@ -148,8 +148,14 @@ std::list<result_t> &YuNetDetect::run(const dl::image::img_t &img)
             r.box = {(int)(((cx - w * 0.5f) - bl) * inv_sx), (int)(((cy - h * 0.5f) - bt) * inv_sy),
                      (int)(((cx + w * 0.5f) - bl) * inv_sx), (int)(((cy + h * 0.5f) - bt) * inv_sy)};
 
-            // 5 landmarks in YuNet order [RE, LE, nose, RM, LM] -> reorder to the recognizer's
-            // [LE, LM, nose, RE, RM] = yunet indices {1, 4, 2, 0, 3}.
+            // esp-dl's recognizer aligns to s_std_ldks_112, which fills its 5 slots BY IMAGE SIDE:
+            // [img-left-eye, img-left-mouth, nose, img-right-eye, img-right-mouth] (slot0 is at x=38 =
+            // image-left). On-device DBG shows the raw YuNet indices land as: 0=img-left-eye,
+            // 1=img-right-eye, 2=nose, 3=img-left-mouth, 4=img-right-mouth. So fill BY IMAGE SIDE:
+            // slot0<-0, slot1<-3, slot2<-2, slot3<-1, slot4<-4. (The earlier {1,4,2,0,3} mapped by
+            // anatomical L/R and fed the image-RIGHT eye into the image-LEFT slot -> a reflected
+            // correspondence esp-dl's similarity transform can't represent, which collapsed all
+            // identities together [YuNet impostor sim ~0.8 vs MSRMNP ~0.2]; see TEST_LOG Test 006.)
             int lx[5], ly[5];
             for (int k = 0; k < 5; k++) {
                 float kx = dequantize(p_kps[i * 10 + 2 * k], sc_kps);
@@ -157,7 +163,7 @@ std::list<result_t> &YuNetDetect::run(const dl::image::img_t &img)
                 lx[k] = (int)((((kx + col) * s) - bl) * inv_sx);
                 ly[k] = (int)((((ky + row) * s) - bt) * inv_sy);
             }
-            r.keypoint = {lx[1], ly[1], lx[4], ly[4], lx[2], ly[2], lx[0], ly[0], lx[3], ly[3]};
+            r.keypoint = {lx[0], ly[0], lx[3], ly[3], lx[2], ly[2], lx[1], ly[1], lx[4], ly[4]};
 
             m_results.insert(std::upper_bound(m_results.begin(), m_results.end(), r, greater_box), r);
         }
