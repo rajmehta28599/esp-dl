@@ -14,6 +14,109 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 006 — 2026-06-19 · YuNet vs MSRMNP comparison ISOLATES a YuNet alignment bug (found + fixed)
+**Build:** `v3.3.5-27-g663d73f` (same as Test 005). Ran the clean 3-person protocol on **YuNet+MFN** and
+**YuNet+MBF**, with the MSRMNP run as the control. The `2nd=` instrumentation made the cause unmistakable.
+
+**Cross-identity (`2nd` = a DIFFERENT enrolled person) — the decisive metric:**
+| combo | genuine (top-1) | cross-identity (`2nd`) | verdict |
+|---|---|---|---|
+| MSRMNP+MFN (control) | 0.6–0.95 | **0.12–0.25** | clean |
+| YuNet+MFN | 0.6–0.93 | **0.62–0.78** | broken |
+| YuNet+MBF | 0.78–0.93 | **0.76–0.86** | broken (≈ genuine) |
+
+Example YuNet lines: `MBF,id=1,sim=0.8627,2nd=2/0.8607,margin=0.0020`; `MBF,id=3,sim=0.8382,2nd=2/0.8368`;
+`MFN,id=2,sim=0.7379,2nd=1/0.7298`. Different people score ~0.8 against each other → id1↔id2/id3 confusion.
+The margin gate rejected most cross-matches (tiny margins) but also killed genuine matches and let a few
+wrong-IDs through — matching the user's "id1 matches id2" report.
+
+**ROOT CAUSE = YuNet landmark reorder (alignment), NOT the decision layer.** Same recognizer + margin code;
+only the detector differs. MSRMNP (esp-dl-native landmark order) is clean at 0.12–0.25; YuNet is 0.6–0.86.
+`yunet_detect.cpp:160` fed the image-RIGHT eye into the slot `s_std_ldks_112` expects the image-LEFT eye (and
+likewise mouth) — a reflected correspondence esp-dl's similarity transform can't represent, so it warps every
+face toward the same distorted pose and identities collapse together (genuine stays ~0.8 because same-person
+warps consistently; impostors rise to ~0.8 too). My earlier "consistent flip = no-op" reasoning was WRONG
+(only true for a *clean* mirror; this is a degenerate non-reflective fit).
+
+**Fix → build `v3.3.5-28-gaa0b124`:** fill the 5 alignment slots BY IMAGE SIDE to match the template + MSRMNP:
+slot0←yunet0(img-L eye), slot1←yunet3(img-L mouth), slot2←yunet2(nose), slot3←yunet1(img-R eye), slot4←yunet4
+(img-R mouth) — i.e. swap the eye-pair and mouth-pair vs the old `{1,4,2,0,3}`. Verified against on-device DBG
+pixel positions + `s_std_ldks_112` decode + advisor (independently derived). Distance/frontality unaffected.
+
+**Decision / Test 007 procedure:** flash `v3.3.5-28-gaa0b124` → **CLEAR `persons_MFN_YuNet.bin` +
+`persons_MBF_YuNet.bin`** (old templates are in the flipped-alignment space — reloading them poisons the test;
+MSRMNP DBs are separate + untouched) → re-enroll the 3 people on YuNet+MFN and YuNet+MBF → verify each + an
+unenrolled person. **Success = YuNet `2nd` collapses to ~0.1–0.3 and genuine margins open to 0.3+ (matching
+MSRMNP).** Keep thr 0.62 / margin 0.06 for this run; once YuNet is confirmed clean, consider lowering thr to
+~0.55 to recover weak-enrollee (id1) dips. If YuNet `2nd` only partially drops (~0.4), a residual issue remains.
+
+---
+
+## Test 005 — 2026-06-19 · MSRMNP control: margin+threshold fix VALIDATED (clean separation, 0 false accepts)
+**Build:** `v3.3.5-27-g663d73f` (margin + threshold + top-2 logging). **Control run** (advisor's falsifier):
+fresh — all DBs cleared, then enrolled 3 known people on **MSRMNP+MFN** and verified each + an unenrolled person.
+
+**Result — clean separation at thr 0.62 / margin 0.06:**
+| | genuine (correct id) | cross-id (`2nd`) | margin | false accepts |
+|---|---|---|---|---|
+| id1 (weak enroll) | 0.53–0.92 | — | — | 0 |
+| id2 | 0.88–0.95 | 0.18–0.23 | 0.67–0.76 | 0 |
+| id3 | 0.87–0.94 | 0.19–0.25 | 0.63–0.73 | 0 |
+| unenrolled→id1 | — | 0.12–0.25 → REJECT | — | 0 |
+
+- **DECISION-LAYER DIAGNOSIS CONFIRMED.** MSRMNP cross-identity sims are 0.12–0.25 (max ~0.47 only on a heavily
+  off-angle id3 frame, where the runner-up id1 rose) — well below genuine. **Zero cross-matches, zero false
+  accepts** — the exact opposite of Test 004's YuNet 0.50/no-margin behaviour. The bug was the rule, not the models.
+- This is the **FAR data Test 002/004 never had**: at 0.62 the impostor ceiling is ~0.25, genuine (good frames)
+  0.62–0.95. Huge headroom. id1 was the weak enrollee (some genuine 0.53–0.62 rejects; still punched via voting).
+- min-face gate confirmed distance-sensitive: id3 enroll skipped far frames (`tw=24–48`), succeeded close (`tw=50–51`).
+
+**Decision / next:** fix works. **Test 006 = repeat this exact clean run on YuNet+MFN and YuNet+MBF** (the combos
+where the original cross-matching happened). If YuNet's `2nd`/cross-id sims are also ~0.12–0.25 → YuNet is fixed too,
+lock the threshold (possibly lower to ~0.55 given the headroom; per-combo). If YuNet's `2nd` comes back HIGH (0.4–0.6)
+while MSRMNP's was 0.12–0.25 → isolates a YuNet-alignment problem (fix the landmark reorder in yunet_detect.cpp:160).
+
+---
+
+## Test 004 — 2026-06-19 · min-face gate OK + CRITICAL false-accept/cross-match found (first 3-person test)
+**Build flashed:** Test 004 bundle (fsync + PSRAM templates + min-tensor-face gate); boot reported
+`v3.3.5-24-g12e3a84-dirty` (built dirty before the commits; the live `tw=` field + gate firing confirm the
+bundle is in the image). **First test with THREE people (id1/id2/id3) → first real FAR data.**
+
+**Worked (vs Test 003):** min-face gate fires correctly — `ENROLL` logs `tw=58 -> keep` in Med and
+`tw=46..49 -> skip` as the face shrinks. Enroll quality good (frontal 0.87–1.00, sat 0.00, 5 tmpl/person).
+No crash/leak (int 240–247 KB, PSRAM 12.0 MB).
+
+**CRITICAL — false accepts / identity confusion (the FAR gap Test 002 left unproven):**
+- **Open-set:** with only id1 enrolled, *unenrolled* people matched id1 (sim ≥ 0.50).
+- **Closed-set:** after enrolling id2/id3, enrolled people cross-matched — id1→id2, then id1&id2→id3
+  (worse on **YuNet+MBF**; YuNet+MFN stayed mostly distinct closed-set).
+- **Root cause = DECISION LAYER, not alignment.** Verified this session: features are L2-normalised
+  (`FeatImpl::run`→`postprocess`→`l2_norm`); esp-dl `s_std_ldks_112` order = `[LE,LM,nose,RE,RM]` (matches the
+  YuNet reorder); and YuNet+MBF **genuine sims hit 0.80–0.92** in this same run — a degenerate warp can't do
+  that. The bug: accept was `sim ≥ 0.50` with **no margin**, and 0.50 sits below these int8 models' FAR=1e-4
+  operating point, so impostors (~0.5–0.65) clear it.
+- **Data caveat (why this run can't calibrate a threshold):** id1 was a **stale prior-session** enrollment
+  (`loaded 1 person/5 templates` *before* any enroll), and the MBF section had a **mid-session CLEAR** (db→0
+  then re-enroll). Numbers are confounded.
+
+**Fix → Test 005 build `v3.3.5-26-g8b27713`:** (1) `PersonDB::match()` returns the runner-up identity;
+(2) accept now needs `sim ≥ RECO_ACCEPT_THR` **AND** `(sim − second_sim) ≥ RECO_MARGIN` (margin auto-passes
+with <2 people → open-set gated by the absolute threshold); (3) `RECO_ACCEPT_THR 0.50→0.62`, `RECO_MARGIN
+0.06` — **INTERIM, precision-leaning, NOT final**; (4) `VERIFY` log now prints `2nd=id/sim` + `margin`.
+
+**Decision / Test 005 procedure (CLEAN controlled run):**
+1. Flash `v3.3.5-26-g8b27713`; **CLEAR every DB** (all 4 det×reco files — current ones are stale/damaged).
+2. Enroll a **fixed set of 3 known people** on the combo under test (Med/Tight range, good light).
+3. **Systematic verify:** each enrolled person in turn + at least one **unenrolled** person. Per `VERIFY`
+   line record matched id, sim, 2nd id/sim, margin, decision. Genuine → clear margin to 2nd; impostor/
+   cross-match → sim ≈ 2nd → REJECT.
+4. **Control: run MSRMNP+MFN too** (no landmark reorder). MSRMNP cleanly separating at 0.62 while YuNet
+   doesn't ⇒ YuNet alignment after all; both behaving alike ⇒ confirmed decision-layer (expected).
+5. Set the FINAL `RECO_ACCEPT_THR`/`RECO_MARGIN` (per-combo if needed) from the genuine-vs-impostor sims.
+
+---
+
 ## Test 003 — 2026-06-19 · Persistence failure across power-cycle (CRITICAL bug found + fixed)
 **Build flashed:** same as Test 002 (`v3.3.5-24-g12e3a84`). **Power-cycled** after Test 002, did NOT reflash.
 **Symptom (user):** "wrong recognition accuracy" — genuine person REJECTED.
