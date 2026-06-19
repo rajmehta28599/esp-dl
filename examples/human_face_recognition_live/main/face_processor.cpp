@@ -989,8 +989,11 @@ static void ai_task(void *arg)
                         g_reco_id = m.person_id;
                         g_reco_sim = m.sim;                              // fused raw cosine, kept for log
                         // Accept only if the top-1 clears the absolute threshold AND beats the
-                        // runner-up identity by RECO_MARGIN (margin auto-passes when no runner-up).
-                        float margin = (m.second_sim < 0.0f) ? 99.0f : (m.sim - m.second_sim);
+                        // runner-up identity by RECO_MARGIN. No runner-up (single-person DB) -> margin
+                        // auto-passes, so open-set is gated by the absolute threshold alone. Use
+                        // second_id (not second_sim) for the "no runner-up" test: cosine can be < 0.
+                        bool has_runner = (m.second_id >= 0);
+                        float margin = has_runner ? (m.sim - m.second_sim) : 99.0f;
                         g_reco_recognized =
                             (m.person_id > 0 && m.sim >= RECO_ACCEPT_THR && margin >= RECO_MARGIN);
                         vote_push(g_reco_recognized ? m.person_id : -1);
@@ -999,7 +1002,7 @@ static void ai_task(void *arg)
                         // impostor/cross-match shows top-1 ~= 2nd (small margin -> now REJECTed).
                         ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,2nd=%d/%.4f,margin=%.4f,thr=%.2f,mgn=%.2f,%s,db=%d",
                                  g_stats.reco_model, g_reco_id, g_reco_sim, m.second_id, m.second_sim,
-                                 (m.second_sim < 0.0f ? -1.0 : (double)margin), (double)RECO_ACCEPT_THR,
+                                 (has_runner ? (double)margin : -1.0), (double)RECO_ACCEPT_THR,
                                  (double)RECO_MARGIN, g_reco_recognized ? "ACCEPT" : "REJECT",
                                  g_persons.num_templates());
                     }
