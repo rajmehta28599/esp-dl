@@ -6,9 +6,11 @@
 #include "human_face_detect.hpp"
 #include "human_face_recognition.hpp"
 #include "yunet_detect.hpp"
+#include "person_db.hpp"
 #include "dl_image_define.hpp"
 #include "dl_image_draw.hpp"
 #include "dl_image_jpeg.hpp"
+#include "dl_tensor_base.hpp"
 
 // Embedded known-good test image (from the static human_face_detect example) used for
 // the boot self-test that isolates "camera image problem" from "model/threshold problem".
@@ -180,7 +182,11 @@ struct FaceBox {
 };
 
 static dl::detect::Detect *g_detect = nullptr; // MSRMNP/ESPDet (HumanFaceDetect) or YuNetDetect
-static HumanFaceRecognizer *g_recognizer = nullptr;
+static HumanFaceRecognizer *g_recognizer = nullptr; // kept for FEATURE EXTRACTION only (get_feat_model)
+
+// Multi-template person database (see person_db.hpp). Owns enrollment storage + matching now;
+// g_recognizer is used only to extract the aligned/L2-normalised feature. Touched ONLY by ai_task.
+static PersonDB g_persons;
 
 static uint8_t *g_ai_buf = nullptr;
 static size_t g_ai_buf_len = 0;
@@ -218,6 +224,28 @@ static bool g_pix_locked = true;
 // built on-device. Raise/lower RECO_ACCEPT_THR to trade TAR vs FAR.
 #define RECO_QUERY_THR -1.0f
 #define RECO_ACCEPT_THR 0.5f
+
+/* ---- Enrollment quality gating + multi-template (Phase 1 accuracy) ----------
+ * BENCHMARK_REPORT.md finding #1: a single bad enroll frame silently breaks recognition
+ * (accept ~8%); a good enroll restores it (~98%). So ENROLL now runs a short capture SESSION,
+ * keeps only the best quality-passing frames, and stores several templates per person which are
+ * fused (max cosine) at match time. Probe frames are quality-gated too so a blurry/oblique frame
+ * does not flip the decision. Thresholds are deliberately lenient; the dashboard shows the raw
+ * numbers (sharp/frontal) so they can be tightened per deployment. */
+#define ENROLL_WINDOW_US 2500000   // collect for ~2.5 s after ENROLL is tapped
+#define ENROLL_TEMPLATES 5         // target templates per person (best-quality kept)
+#define ENROLL_MIN_TEMPLATES 2     // commit if at least this many good frames were captured
+#define ENROLL_MIN_GAP_US 200000   // >=200 ms between captures -> templates span pose/light
+#define Q_MIN_DET_SCORE 0.40f      // detector confidence floor (just above the 0.30 detect threshold)
+#define Q_MIN_SHARP 3.0f           // gentle focus floor; sharpness mainly RANKS enroll frames, not gates
+#define Q_MIN_FRONTAL 0.50f        // 0..1 frontality from the 5 landmarks (1 = head-on); geometry-based
+#define Q_MAX_SAT 0.25f            // reject faces this blown-out (screen glare / overexposed)
+
+/* ---- Temporal voting before a punch -----------------------------------------
+ * Require the same person to win K of the last M recognitions before firing a PUNCH. This
+ * tightens the false-accept rate on top of the per-id debounce: a one-frame mis-ID cannot punch. */
+#define VOTE_M 5 // window of recent recognitions
+#define VOTE_K 3 // agreements required
 
 /* ---- Distance estimation + positioning guide -------------------------------
  * Estimated from the largest face using the pinhole model dist = K / size_px.
@@ -493,6 +521,167 @@ static void capture_punch_thumb(const uint16_t *buf, int bw, int bh, int x0, int
     }
 }
 
+/* ==================== Phase 1: recognition accuracy helpers ==================== */
+
+// Per-(recognizer x detector) DB file. Alignment is not interchangeable across detectors
+// (BENCHMARK_REPORT.md 3.2), so each pair keeps its own person database.
+static std::string persons_path()
+{
+    return std::string(g_db_dir) + "/persons_" + FEAT_MODELS[g_feat_model_idx].name + "_" +
+           DET_MODELS[g_det_model_idx].name + ".bin";
+}
+
+static void load_persons()
+{
+    int flen = g_recognizer->get_feat_model()->get_feat_len(); // lazy-loads the feat model
+    g_persons.load(persons_path(), flen);
+}
+
+// Extract the aligned, L2-normalised feature for a detected face into `out` (feat_len floats).
+// The feature tensor is owned/reused by the model, so copy it out immediately.
+static bool extract_feat(dl::image::img_t &img, const dl::detect::result_t &det, std::vector<float> &out)
+{
+    if (det.keypoint.size() != 10) {
+        return false;
+    }
+    dl::TensorBase *f = g_recognizer->get_feat_model()->run(img, det.keypoint);
+    if (!f || f->dtype != dl::DATA_TYPE_FLOAT || f->size <= 0) {
+        return false;
+    }
+    out.resize(f->size);
+    memcpy(out.data(), f->data, (size_t)f->size * sizeof(float));
+    return true;
+}
+
+// Face quality used to gate both enrollment and probe frames.
+struct face_quality_t {
+    int width;
+    float det_score;
+    float sharp;   // mean |Laplacian| over the face ROI (higher = sharper / in focus)
+    float frontal; // 0..1 from the 5 landmarks (1 = head-on)
+    float sat;     // 0..1 blown-out fraction inside the face
+    bool ok;
+};
+
+static face_quality_t score_face(const uint16_t *buf, int bw, int bh, const dl::detect::result_t &det)
+{
+    face_quality_t q = {0, 0.0f, 0.0f, 0.0f, 0.0f, false};
+    if (det.box.size() < 4) {
+        return q;
+    }
+    int x0 = det.box[0], y0 = det.box[1], x1 = det.box[2], y1 = det.box[3];
+    q.width = x1 - x0;
+    q.det_score = det.score;
+    if (x0 < 1) x0 = 1;
+    if (y0 < 1) y0 = 1;
+    if (x1 > bw - 1) x1 = bw - 1;
+    if (y1 > bh - 1) y1 = bh - 1;
+    if (x1 <= x0 + 2 || y1 <= y0 + 2) {
+        return q;
+    }
+
+    // Sharpness: mean |4-neighbour Laplacian| of luma over the face (subsampled).
+    long lap_sum = 0, lap_n = 0;
+    for (int y = y0 + 1; y < y1 - 1; y += 2) {
+        const uint16_t *row = buf + (size_t)y * bw;
+        const uint16_t *up = row - bw, *dn = row + bw;
+        for (int x = x0 + 1; x < x1 - 1; x += 2) {
+            int c = luma_bgr565(row[x]);
+            int l = 4 * c - luma_bgr565(row[x - 1]) - luma_bgr565(row[x + 1]) - luma_bgr565(up[x]) -
+                    luma_bgr565(dn[x]);
+            lap_sum += (l < 0 ? -l : l);
+            lap_n++;
+        }
+    }
+    q.sharp = lap_n > 0 ? (float)lap_sum / (float)lap_n : 0.0f;
+
+    // Exposure inside the face box.
+    region_stats_t fs = analyze_region(buf, bw, bh, x0, y0, x1, y1, 3);
+    q.sat = fs.sat_frac;
+
+    // Frontality from landmarks (esp-dl order: LE=0,1 LM=2,3 nose=4,5 RE=6,7 RM=8,9).
+    if (det.keypoint.size() == 10) {
+        const std::vector<int> &k = det.keypoint;
+        float lex = k[0], ley = k[1], rex = k[6], rey = k[7], nx = k[4];
+        float eye_dx = rex - lex;
+        if (fabsf(eye_dx) > 1.0f) {
+            float ratio = (nx - lex) / eye_dx;                                  // ~0.5 head-on
+            float horiz = 1.0f - fminf(1.0f, fabsf(rey - ley) / fabsf(eye_dx)); // eye line level
+            float center = 1.0f - fminf(1.0f, 2.0f * fabsf(ratio - 0.5f));      // nose centred
+            q.frontal = fmaxf(0.0f, 0.5f * horiz + 0.5f * center);
+        }
+    }
+
+    q.ok = q.width >= MIN_FACE_WIDTH && q.det_score >= Q_MIN_DET_SCORE && q.sharp >= Q_MIN_SHARP &&
+           q.frontal >= Q_MIN_FRONTAL && q.sat <= Q_MAX_SAT;
+    return q;
+}
+
+// Temporal voting over recent recognitions (person id, or -1 for reject/none).
+static int g_vote[VOTE_M] = {0};
+static int g_vote_idx = 0;
+static int g_vote_n = 0;
+static void vote_reset()
+{
+    g_vote_idx = 0;
+    g_vote_n = 0;
+}
+static void vote_push(int pid)
+{
+    g_vote[g_vote_idx] = pid;
+    g_vote_idx = (g_vote_idx + 1) % VOTE_M;
+    if (g_vote_n < VOTE_M) {
+        g_vote_n++;
+    }
+}
+// Person id with >= VOTE_K of the last VOTE_M votes, else -1.
+static int vote_majority()
+{
+    for (int i = 0; i < g_vote_n; i++) {
+        int pid = g_vote[i];
+        if (pid <= 0) {
+            continue;
+        }
+        int c = 0;
+        for (int j = 0; j < g_vote_n; j++) {
+            if (g_vote[j] == pid) {
+                c++;
+            }
+        }
+        if (c >= VOTE_K) {
+            return pid;
+        }
+    }
+    return -1;
+}
+
+// Enrollment session: a bounded best-N (by quality) set of candidate templates.
+struct enroll_cand_t {
+    float quality;
+    std::vector<float> feat;
+};
+static bool g_enroll_active = false;
+static int64_t g_enroll_deadline_us = 0;
+static int64_t g_enroll_last_cap_us = 0;
+static std::vector<enroll_cand_t> g_enroll_cands;
+
+static void enroll_consider(float quality, std::vector<float> &&feat)
+{
+    if ((int)g_enroll_cands.size() < ENROLL_TEMPLATES) {
+        g_enroll_cands.push_back({quality, std::move(feat)});
+        return;
+    }
+    int worst = 0; // replace the worst kept candidate if this one is better
+    for (int i = 1; i < (int)g_enroll_cands.size(); i++) {
+        if (g_enroll_cands[i].quality < g_enroll_cands[worst].quality) {
+            worst = i;
+        }
+    }
+    if (quality > g_enroll_cands[worst].quality) {
+        g_enroll_cands[worst] = {quality, std::move(feat)};
+    }
+}
+
 #if CAM_AUTODETECT_PIX
 /* -------- one-time runtime calibration of the camera pixel format -------- */
 static void calibrate_pix(dl::image::img_t &img)
@@ -558,6 +747,9 @@ static void apply_det_model(int idx)
     g_reco_valid = false; // old recognition no longer applies
     g_last_reco_us = 0;
     requery_det_info();
+    load_persons(); // alignment differs per detector -> load this (reco x det) pair's DB
+    vote_reset();
+    g_enroll_active = false;
     ESP_LOGI(TAG, "detector -> %s (%dx%d, keypoints=%d)", DET_MODELS[idx].name, g_stats.model_in_w,
              g_stats.model_in_h, (int)g_det_has_kp);
     char st[80];
@@ -592,11 +784,14 @@ static void apply_feat_model(int idx)
     g_stats.feat_tar = FEAT_MODELS[idx].tar;
     strncpy(g_stats.reco_model, FEAT_MODELS[idx].name, sizeof(g_stats.reco_model) - 1);
     g_stats.reco_model[sizeof(g_stats.reco_model) - 1] = '\0';
-    ESP_LOGI(TAG, "recognizer -> %s (feat_len=%d, db=%s, has %d face(s))", FEAT_MODELS[idx].name,
-             g_stats.feat_len, FEAT_MODELS[idx].db_file, g_recognizer->get_num_feats());
-    char st[80];
-    snprintf(st, sizeof(st), "Recognizer: %s  (its own DB: %d face(s))", FEAT_MODELS[idx].name,
-             g_recognizer->get_num_feats());
+    load_persons(); // each (reco x det) pair has its own multi-template DB
+    vote_reset();
+    g_enroll_active = false;
+    ESP_LOGI(TAG, "recognizer -> %s (feat_len=%d, db has %d person(s) / %d template(s))",
+             FEAT_MODELS[idx].name, g_stats.feat_len, g_persons.num_persons(), g_persons.num_templates());
+    char st[96];
+    snprintf(st, sizeof(st), "Recognizer: %s  (%d person(s), %d template(s))", FEAT_MODELS[idx].name,
+             g_persons.num_persons(), g_persons.num_templates());
     ui_set_enroll_status(st);
 }
 
@@ -610,7 +805,11 @@ static void ai_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         if (g_clear_request) {
-            g_recognizer->clear_all_feats();
+            g_persons.clear();
+            g_persons.save();
+            g_enroll_active = false;
+            g_reco_valid = false;
+            vote_reset();
             g_clear_request = false;
             ui_set_enroll_status("Database cleared");
         }
@@ -743,29 +942,30 @@ static void ai_task(void *arg)
         } else {
             g_stats.rec_state = largest_ok ? 2 : 0; // 2 = face present, waiting for window
         }
-        if (can_recognize && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
-            std::list<dl::detect::result_t> one = {*largest_det};
-            int64_t rec0 = esp_timer_get_time();
-            // Query thr is RECO_QUERY_THR (low) -> rec[0] is the top-1 match with RAW similarity.
-            std::vector<dl::recognition::result_t> rec = g_recognizer->recognize(img, one);
-            g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
-            g_stats.rec_state = 1; // ran this frame
-            g_last_reco_us = now_us;
-            g_reco_valid = true;
-            if (!rec.empty()) {
-                g_reco_id = rec[0].id;
-                g_reco_sim = rec[0].similarity;                 // raw cosine, kept for display/log
-                g_reco_recognized = (g_reco_sim >= RECO_ACCEPT_THR); // firmware accept decision
-            } else {
-                g_reco_recognized = false; // empty DB - nothing enrolled to match against
-                g_reco_id = -1;
-                g_reco_sim = 0.0f;
+        if (can_recognize && !g_enroll_active && (now_us - g_last_reco_us > RECOGNIZE_INTERVAL_US)) {
+            // Probe quality gate (cheap): skip blurry / oblique / blown probes so a bad frame cannot
+            // flip the decision. Only pay the ~165 ms feature extraction on a good frame.
+            face_quality_t pq = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
+            if (pq.ok) {
+                int64_t rec0 = esp_timer_get_time();
+                std::vector<float> probe;
+                if (extract_feat(img, *largest_det, probe)) {
+                    PersonDB::MatchResult m = g_persons.match(probe.data());
+                    g_stats.rec_ms = (float)(esp_timer_get_time() - rec0) / 1000.0f;
+                    g_stats.rec_state = 1; // ran this frame
+                    g_last_reco_us = now_us;
+                    g_reco_valid = true;
+                    g_reco_id = m.person_id;
+                    g_reco_sim = m.sim;                                  // fused raw cosine, kept for log
+                    g_reco_recognized = (m.person_id > 0 && m.sim >= RECO_ACCEPT_THR);
+                    vote_push(g_reco_recognized ? m.person_id : -1);
+                    // TAR/FAR proof: raw score + decision per recognition. Grep "VERIFY," in the monitor.
+                    ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,thr=%.2f,%s,db=%d", g_stats.reco_model,
+                             g_reco_id, g_reco_sim, (double)RECO_ACCEPT_THR,
+                             g_reco_recognized ? "ACCEPT" : "REJECT", g_persons.num_templates());
+                }
             }
-            // TAR/FAR proof: log every recognition's raw score + decision (genuine vs impostor
-            // is labelled by YOUR test protocol). Grep "VERIFY," in the monitor.
-            ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,thr=%.2f,%s,db=%d", g_stats.reco_model, g_reco_id,
-                     g_reco_sim, (double)RECO_ACCEPT_THR, g_reco_recognized ? "ACCEPT" : "REJECT",
-                     g_recognizer->get_num_feats());
+            // else: poor probe quality -> leave rec_state at 2 (waiting) and keep the sticky result.
         }
         // Reuse the most recent recognition result for the prominent face's box.
         if (largest_idx >= 0 && g_reco_valid && (now_us - g_last_reco_us < RECO_STICKY_US)) {
@@ -774,24 +974,58 @@ static void ai_task(void *arg)
             local[largest_idx].sim = g_reco_sim;
         }
 
-        // Handle an enroll request on the most prominent face.
+        // --- Multi-frame, quality-gated enrollment session (started by the ENROLL button) ---
+        // Rising edge: begin a capture session (unless the detector emits no landmarks).
         if (g_enroll_request) {
+            g_enroll_request = false;
             if (!g_det_has_kp) {
-                ui_set_enroll_status("Switch to MSRMNP to enroll (ESPDet has no landmarks)");
-                g_enroll_request = false;
-            } else if (can_recognize) {
-                std::list<dl::detect::result_t> one = {*largest_det};
-                if (g_recognizer->enroll(img, one) == ESP_OK) {
-                    snprintf(status, sizeof(status), "Enrolled on %s. DB now %d face(s)",
-                             FEAT_MODELS[g_feat_model_idx].name, g_recognizer->get_num_feats());
+                ui_set_enroll_status("Switch to MSRMNP/YuNet to enroll (ESPDet has no landmarks)");
+            } else {
+                g_enroll_active = true;
+                g_enroll_deadline_us = now_us + ENROLL_WINDOW_US;
+                g_enroll_last_cap_us = 0;
+                g_enroll_cands.clear();
+                ui_set_enroll_status("Enrolling: hold still, look at the camera...");
+            }
+        }
+        // While active: collect the best quality-passing frames (>=ENROLL_MIN_GAP_US apart), then commit.
+        if (g_enroll_active) {
+            if (can_recognize && (now_us - g_enroll_last_cap_us > ENROLL_MIN_GAP_US)) {
+                face_quality_t q = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
+                // Calibration aid: grep "ENROLL," to see real quality numbers and tune the Q_* gates.
+                ESP_LOGI("ENROLL", "frame sharp=%.1f frontal=%.2f w=%d sat=%.2f -> %s", q.sharp, q.frontal,
+                         q.width, q.sat, q.ok ? "keep" : "skip");
+                if (q.ok) {
+                    std::vector<float> feat;
+                    if (extract_feat(img, *largest_det, feat)) {
+                        // rank by combined quality (sharper + more frontal + larger = better)
+                        float rank = q.sharp + 40.0f * q.frontal + 0.1f * q.width;
+                        enroll_consider(rank, std::move(feat));
+                        g_enroll_last_cap_us = now_us;
+                        snprintf(status, sizeof(status), "Enrolling... %d/%d good frame(s)",
+                                 (int)g_enroll_cands.size(), ENROLL_TEMPLATES);
+                        ui_set_enroll_status(status);
+                    }
+                }
+            }
+            if ((int)g_enroll_cands.size() >= ENROLL_TEMPLATES || now_us >= g_enroll_deadline_us) {
+                g_enroll_active = false;
+                if ((int)g_enroll_cands.size() >= ENROLL_MIN_TEMPLATES) {
+                    int pid = g_persons.add_person(nullptr); // name assignable later (UI/serial)
+                    for (auto &c : g_enroll_cands) {
+                        g_persons.add_template(pid, c.feat.data());
+                    }
+                    g_persons.save();
+                    snprintf(status, sizeof(status), "Enrolled person %d (%d templates) on %s", pid,
+                             (int)g_enroll_cands.size(), FEAT_MODELS[g_feat_model_idx].name);
                     g_last_reco_us = 0; // re-recognize immediately so the new face turns green
+                    vote_reset();
                 } else {
-                    snprintf(status, sizeof(status), "Enroll failed");
+                    snprintf(status, sizeof(status),
+                             "Enroll failed: need a clear, well-lit, front-facing face. Try again.");
                 }
                 ui_set_enroll_status(status);
-                g_enroll_request = false;
-            } else {
-                ui_set_enroll_status("No clear face - face the camera at ~arm's length");
+                g_enroll_cands.clear();
             }
         }
 
@@ -844,9 +1078,13 @@ static void ai_task(void *arg)
         static int64_t s_last_punch_us = 0;
         static int s_last_punch_id = -1;
         bool accepted = (largest_idx >= 0) && local[largest_idx].recognized;
+        // Temporal vote: the same person must win VOTE_K of the last VOTE_M recognitions. A single
+        // mis-ID frame cannot punch (tightens FAR on top of the per-id debounce below).
+        int voted = vote_majority();
+        bool vote_ok = accepted && (voted > 0) && (voted == local[largest_idx].id);
         bool not_spoof = (g_spoof_mode == 0) || (g_stats.spoof_state != 2);
         bool dist_ok = !PUNCH_REQUIRE_DIST_OK || (g_stats.dist_guide == 1);
-        if (accepted && not_spoof && dist_ok && !g_punch_pending) {
+        if (vote_ok && not_spoof && dist_ok && !g_punch_pending) {
             int pid = local[largest_idx].id;
             if (pid != s_last_punch_id || (now_us - s_last_punch_us > PUNCH_DEBOUNCE_US)) {
                 s_last_punch_us = now_us;
@@ -880,15 +1118,17 @@ static void ai_task(void *arg)
 
         int ms = (int)((esp_timer_get_time() - t0) / 1000);
         int show = (largest_idx >= 0) ? largest_idx : 0;
-        int db_count = g_recognizer->get_num_feats();
+        int db_count = g_persons.num_templates(); // total enrolled templates (feature vectors)
+        int db_people = g_persons.num_persons();
         if (n == 0) {
-            snprintf(status, sizeof(status), "Faces: 0    DB: %d", db_count);
+            snprintf(status, sizeof(status), "Faces: 0    DB: %d ppl", db_people);
         } else if (local[show].recognized) {
-            snprintf(status, sizeof(status), "Faces: %d    ID %d  (%.2f)    DB: %d",
-                     n, local[show].id, local[show].sim, db_count);
+            const char *nm = g_persons.person_name(local[show].id);
+            snprintf(status, sizeof(status), "Faces: %d    ID %d %s (%.2f)    DB: %d ppl", n,
+                     local[show].id, nm, local[show].sim, db_people);
         } else {
-            snprintf(status, sizeof(status), "Faces: %d    unknown (best %.2f)    DB: %d", n,
-                     local[show].sim, db_count);
+            snprintf(status, sizeof(status), "Faces: %d    unknown (best %.2f)    DB: %d ppl", n,
+                     local[show].sim, db_people);
         }
         ui_set_status(status);
 
@@ -1022,9 +1262,10 @@ esp_err_t face_processor_init(const char *db_path)
 
     g_detect = make_detector(g_det_model_idx);
     g_recognizer = new HumanFaceRecognizer(feat_db_path(g_feat_model_idx), FEAT_MODELS[g_feat_model_idx].type);
-    g_recognizer->set_thr(RECO_QUERY_THR); // return raw top-1 similarity; firmware decides accept
-    ESP_LOGI(TAG, "models created, recognizer DB '%s' has %d face(s)", FEAT_MODELS[g_feat_model_idx].db_file,
-             g_recognizer->get_num_feats());
+    g_recognizer->set_thr(RECO_QUERY_THR); // (legacy esp-dl DB unused now; kept for feature extraction)
+    load_persons();                        // this (recognizer x detector) pair's multi-template person DB
+    ESP_LOGI(TAG, "models created; person DB has %d person(s) / %d template(s)", g_persons.num_persons(),
+             g_persons.num_templates());
 
     // Active model info for the panel.
     g_stats.feat_len = g_recognizer->get_feat_model()->get_feat_len();

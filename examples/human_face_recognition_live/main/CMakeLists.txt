@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.cpp" "face_processor.cpp" "ui.cpp" "yunet_detect.cpp"
+    SRCS "app_main.cpp" "face_processor.cpp" "ui.cpp" "yunet_detect.cpp" "person_db.cpp"
     INCLUDE_DIRS "."
     REQUIRES human_face_recognition
              esp-dl
