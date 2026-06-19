@@ -56,7 +56,10 @@ static const char *TAG = "face_proc";
 // DISPLAY-ONLY: applied after overlays + after the AI copy, so detection, recognition and the
 // face DB are unaffected, and the LVGL text/buttons (composited separately) are NOT mirrored.
 // If the flip is the wrong way for your camera mounting, set this to 0.
-#define DISPLAY_MIRROR_X 1
+// SPEED PROBE (Test 010): set to 0 to drop the full-frame ~20 ms/frame CPU mirror from core 0
+// (the one work-ELIMINATING display lever that needs no rewrite). Cosmetic only — the live preview
+// is no longer left-right flipped. Set back to 1 if the selfie-style flip is wanted on the kiosk.
+#define DISPLAY_MIRROR_X 0
 
 #define MAX_FACES 5
 // Only enroll/recognize faces at least this wide (px) to avoid junk features.
