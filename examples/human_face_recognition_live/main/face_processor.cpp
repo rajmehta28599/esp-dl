@@ -1,5 +1,6 @@
 #include "face_processor.hpp"
 #include "ui.hpp"
+#include "ppa_display.hpp"
 
 #include "bsp_camera.h"
 
@@ -433,7 +434,11 @@ static void frame_cb(uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t l
     g_stats.draw_ms = (float)(esp_timer_get_time() - d0) / 1000.0f;
 
     int64_t f0 = esp_timer_get_time();
+#if USE_PPA_DISPLAY
+    ppa_display_blit(buf, w, h); // camera -> DSI FB in hardware (no lv_refr_now flush on core 0)
+#else
     ui_update_camera_canvas(buf, w, h);
+#endif
     g_stats.disp_ms = (float)(esp_timer_get_time() - f0) / 1000.0f;
 
     // Displayed frame rate + core-0 compute load, averaged over ~1 s windows.

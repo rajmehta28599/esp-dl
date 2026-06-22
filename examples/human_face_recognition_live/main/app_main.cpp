@@ -20,6 +20,7 @@
 #include "bsp_camera.h"
 #include "ui.hpp"
 #include "face_processor.hpp"
+#include "ppa_display.hpp"
 
 #include <string>
 
@@ -75,6 +76,12 @@ extern "C" void app_main(void)
 
     // 5. Build the on-screen UI.
     ui_init();
+#if USE_PPA_DISPLAY
+    err = ppa_display_init(); // register PPA SRM client + grab the DSI framebuffer (after panel up)
+    if (err != ESP_OK) {
+        fatal("ppa display", err);
+    }
+#endif
     err = set_lcd_blight(100);
     if (err != ESP_OK) {
         fatal("backlight", err);

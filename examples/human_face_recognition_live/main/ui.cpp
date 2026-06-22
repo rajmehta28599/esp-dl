@@ -1,5 +1,6 @@
 #include "ui.hpp"
 #include "face_processor.hpp"
+#include "ppa_display.hpp"
 #include "bsp_display.h"
 
 #include "lvgl.h"
@@ -260,8 +261,55 @@ static void stats_timer_cb(lv_timer_t *timer)
     }
 }
 
+#if USE_PPA_DISPLAY
+// ---- Increment-1 PPA coexistence spike UI ----
+// PPA owns the TOP camera region; LVGL draws ONLY this bottom chrome strip (rows >= PPA_CAM_H).
+// A live-updating label here, shown alongside the live PPA camera above, is the coexistence proof.
+static lv_obj_t *s_spike_lbl = nullptr;
+
+static void spike_stats_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!s_spike_lbl) {
+        return;
+    }
+    static pipeline_stats_t s;
+    face_processor_get_stats(&s);
+    static char b[120];
+    snprintf(b, sizeof(b), "FPS %.0f   cap %.0f   det %.0f   rec %.0f   disp %.1f   C0 %.0f%% C1 %.0f%%",
+             s.fps, s.cap_ms, s.det_ms, s.rec_ms, s.disp_ms, s.load_core0, s.load_core1);
+    lv_label_set_text(s_spike_lbl, b);
+}
+
+static void ui_init_spike(void)
+{
+    lvgl_port_lock(0);
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_label_set_text(title, "PPA SPIKE  -  camera above = PPA,  this line = LVGL");
+    lv_obj_align(title, LV_ALIGN_BOTTOM_LEFT, 12, -78);
+
+    s_spike_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_spike_lbl, lv_color_hex(0x66ff66), 0);
+    lv_obj_set_style_text_font(s_spike_lbl, &lv_font_montserrat_20, 0);
+    lv_label_set_text(s_spike_lbl, "warming up...");
+    lv_obj_align(s_spike_lbl, LV_ALIGN_BOTTOM_LEFT, 12, -40);
+    lv_timer_create(spike_stats_timer_cb, 300, nullptr);
+
+    lvgl_port_unlock();
+}
+#endif // USE_PPA_DISPLAY
+
 void ui_init(void)
 {
+#if USE_PPA_DISPLAY
+    ui_init_spike();
+    return;
+#endif
     lvgl_port_lock(0);
 
     lv_obj_t *scr = lv_scr_act();

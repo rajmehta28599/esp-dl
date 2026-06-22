@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.cpp" "face_processor.cpp" "ui.cpp" "yunet_detect.cpp" "person_db.cpp"
+    SRCS "app_main.cpp" "face_processor.cpp" "ui.cpp" "yunet_detect.cpp" "person_db.cpp" "ppa_display.cpp"
     INCLUDE_DIRS "."
     REQUIRES human_face_recognition
              esp-dl
@@ -8,4 +8,6 @@ idf_component_register(
              bsp_camera
              esp_lvgl_port
              lvgl
+             esp_driver_ppa
+             esp_mm
     EMBED_FILES "human_face.jpg" "yunet_256x192_p4.espdl")

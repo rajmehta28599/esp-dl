@@ -3,7 +3,8 @@
 
 static i2c_master_bus_handle_t sccb_bus_handle = NULL;
 static camera_video_t camera_video;
-static uint8_t *cam_buffer[2];
+static uint8_t *cam_buffer[3]; // 3 (was 2): extra ring depth so non-blocking PPA can finish reading
+                               // a frame before the camera recycles that buffer (~66 ms margin vs ~22 ms PPA)
 static int camera_video_id = 0;
 
 esp_err_t camera_video_init(void)
@@ -277,7 +278,7 @@ int camera_start(int core_id)
         return -1;
     }
     esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &cache_line_size);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         cam_buffer[i] = (uint8_t *)heap_caps_aligned_alloc(
             cache_line_size, CAM_H_RES * CAM_V_RES * CAM_BYTES_PER_PIXEL, MALLOC_CAP_SPIRAM);
         if (!cam_buffer[i]) {
@@ -286,7 +287,7 @@ int camera_start(int core_id)
         }
         memset(cam_buffer[i], 0, CAM_H_RES * CAM_V_RES * CAM_BYTES_PER_PIXEL);
     }
-    if (camera_video_set_bufs(camera_video_id, 2, (const void **)cam_buffer) != ESP_OK) {
+    if (camera_video_set_bufs(camera_video_id, 3, (const void **)cam_buffer) != ESP_OK) {
         return -1;
     }
     if (video_stream_task_start(camera_video_id, core_id) != ESP_OK) {

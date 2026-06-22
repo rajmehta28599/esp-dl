@@ -49,6 +49,7 @@ extern "C" {
 
 extern lv_display_t *g_lvgl_disp;        // LVGL display handle
 extern esp_lcd_touch_handle_t g_touch_handle;
+extern esp_lcd_panel_handle_t panel_handle; // MIPI-DSI panel; a DPI-panel handle (direct FB access, e.g. PPA)
 
 // Initialize backlight + MIPI-DSI panel + LVGL + GT911 touch (registered to LVGL).
 esp_err_t display_init(void);
