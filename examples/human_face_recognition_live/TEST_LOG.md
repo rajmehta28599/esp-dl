@@ -14,6 +14,53 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 020 — 2026-06-22 · YuNet 128×96 study (too noisy) → 256 LOCKED; LVGL full-UI path TWDT-storms
+**Build:** `v3.3.5-40` + `yunet_128x96` (full UI, db=20). **128×96: lightest (det ~38–44 ms) but recognition
+NOISIER.** At close range (300–440 mm): genuine 0.51–0.88 (vs 256's tight 0.62–0.97), several REJECTs at
+0.51–0.62, cross `2nd` 0.28–0.42 (vs 256's 0.07–0.33). Coarse 128 landmarks reduce alignment precision.
+
+**YuNet resolution study COMPLETE — 256×192 WINS (sweet spot):**
+| YuNet | det ms | genuine | cross `2nd` | verdict |
+|---|---|---|---|---|
+| 128×96 | ~40 | 0.51–0.88 (noisy, REJECTs) | 0.28–0.42 | lightest, recognition noisier |
+| **256×192** | ~90 | **0.62–0.97 (clean)** | **0.07–0.33** | **WINNER** |
+| 384×288 | ~235 | 0.6–0.93 | 0.25–0.46 | too heavy (overload) |
+| 512×384 | ~420 | — | — | ruled out |
+Locked `YUNET_RES=256`. Toggle + 128/384 models kept (yunet_port + EMBED, GC'd when unused).
+
+**BIGGER FINDING — the full-UI LVGL path is unhealthy (not detector-related):** the `task_wdt: IDLE0 (CPU0)`
+storm fired with **128 too** (not just 384) — CPU0 pegged **load0 96–100%** in `lv_draw_sw_blend`. Cause: the
+full-screen LVGL flush (~70 ms) exceeds the 33 ms camera period, so `video_stream` never yields → IDLE0 starves.
+**NOT a crash** (warn-only; recognition + punches kept working) but not shippable. The 30 fps **PPA** build
+(Test 018) ran **clean at load0 ~30%**. **=> PPA productionization (full UI on the PPA engine) is now MANDATORY,
+not optional** — it's the only path that gives the full app BOTH 30 fps AND core-0 headroom (no storm). The
+3-buffer ring (added for PPA) may also nudge the LVGL path's starvation, but the root cause is core-0 flush
+saturation; the cure is PPA, not buffer count.
+
+---
+
+## Test 019 — 2026-06-22 · YuNet resolution study: 384×288 too heavy (TWDT overload); 256×192 WINS
+**Build:** `v3.3.5-38` + `yunet_384x288` (full UI, `USE_PPA_DISPLAY=0`, db=20/4 people). Switched DET→YuNet
+(384×288), tested recognition out to ~730 mm.
+
+| YuNet input (full-UI build) | det ms | fps | load0 | range | recognition |
+|---|---|---|---|---|---|
+| 256×192 (baseline) | ~90 | ~9 | 85–100 | medium | genuine 0.62–0.97, `2nd` 0.07–0.33 (clean) |
+| **384×288 (this)** | **210–246** | 10–11 erratic | **97–100** | **~730 mm** | genuine 0.6–0.93, `2nd` **0.25–0.46** (tighter) |
+
+**384×288 extends range** (recognized at dist 690–730 mm, sim 0.74–0.79) **but is too heavy:** det ~235 ms
+hammers PSRAM → core 0's full-UI LVGL flush can't finish → **load0 pegs 97–100%, IDLE0 starves → Task Watchdog
+storm** (fires every 5 s; CPU0 stuck in `lv_draw_sw_blend`). **NOT a crash** — app keeps running ~10–11 fps — but
+overloaded/unstable. Cross-identity margins also got *tighter* (`2nd` 0.25–0.46 vs 256's 0.07–0.33).
+
+**DECISION: 256×192 WINS.** Product is a **COMPACT, CLOSE-RANGE, mobile-like device (NOT a kiosk** — per user),
+so detection range is exactly what it does NOT need → 384's one advantage is wasted while its cost (2.5× det,
+overload, sluggish recognition) is harmful. Reverted `YUNET_USE_384=0`. The watchdog storm is purely the 384
+config; 256×192 runs clean. Optional future: **128×96** if an even lighter detector is wanted (face always
+close). The 384 model + `quantize_yunet_384x288.py` are kept in `yunet_port/` for the record.
+
+---
+
 ## Test 018 — 2026-06-22 · 30 FPS ACHIEVED — non-blocking PPA (speed track COMPLETE, 9→30 = 3.3×)
 **Build:** `v3.3.5-38` (3-buffer camera ring + non-blocking PPA + ISR completion semaphore). **Result: the full win.**
 

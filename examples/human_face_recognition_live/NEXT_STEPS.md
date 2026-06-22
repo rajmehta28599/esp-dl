@@ -23,13 +23,17 @@ Recognition quality is really set by **how many source pixels the face has** = d
 **NEW context:** PPA freed core 1 (~70% idle at 30 fps), so detector latency no longer caps FPS — a heavier
 detector (320/416) is now affordable, which flips the old tradeoff.
 
-| YuNet input | pixels | det ms (PPA-era est) | range | flash | note |
-|---|---|---|---|---|---|
-| 128×96 | 12k | ~15 | short | smallest | far faces missed; coarse landmarks |
-| 192×144 | 28k | ~32 | med-short | small | |
-| **256×192 (current)** | 49k | **~57** | medium | ~152 KB | current kiosk balance |
-| 320×240 | 77k | ~90 | long | bigger | sharper landmarks, more range |
-| 416×320 | 133k | ~155 | longest | biggest | best range, heaviest |
+**Valid resolutions must have BOTH dims ÷32** (strides 8/16/32 → clean grids cols=W/s, rows=H/s; the
+C++ decode assumes exact division). So 4:3 candidates are only: 128×96, 256×192, **384×288**, 512×384.
+(320×240, 192×144, 416×320 are INVALID — 240/144/320 aren't ÷32 → broken grid.) Flash is ~constant
+(~152 KB) at every res — same weights, only the input tensor shape changes.
+
+| YuNet input (grid @s32) | pixels | det ms (PPA-era est) | range | note |
+|---|---|---|---|---|
+| 128×96 (4×3) | 12k | ~14 | short | far faces missed; coarse landmarks |
+| **256×192 (current, 8×6)** | 49k | **~57** | medium | current kiosk balance |
+| **384×288 (12×9)** | 110k | ~128 | long | bigger: more range + sharper landmarks ← **testing now** |
+| 512×384 (16×12) | 196k | ~228 | longest | heaviest; only if range demands it |
 
 **Protocol per resolution:** re-export YuNet at the new input via `quantize_yunet_*.py` (work dir
 `D:\Payroll_FaceDetection\Petpooja_ESP32P4\yunet_port\`) → `EMBED_FILES` swap in main/CMakeLists +
