@@ -13,6 +13,7 @@ static ppa_client_handle_t s_srm = nullptr;
 static uint8_t *s_fb = nullptr; // the DSI panel framebuffer (full screen RGB565, PSRAM/DMA)
 static size_t s_fb_size = 0;
 static SemaphoreHandle_t s_done = nullptr; // given when a PPA blit completes; serializes submissions
+static volatile bool s_paused = false;     // when set, skip blits so LVGL can own the whole FB
 
 // PPA completion callback — runs in ISR context. Returns whether a higher-priority task was woken so
 // the driver performs the yield. Releases s_done so the next frame's blit may submit.
@@ -69,14 +70,18 @@ esp_err_t ppa_display_init(void)
 
 void ppa_display_blit(const uint8_t *cam_buf, uint32_t cam_w, uint32_t cam_h)
 {
-    if (!s_srm || !s_fb || !cam_buf) {
-        return;
+    if (!s_srm || !s_fb || !cam_buf || s_paused) {
+        return; // paused -> LVGL owns the whole FB (modal overlay); skip without touching s_done
     }
     // Wait for the PREVIOUS blit to finish — it ran concurrently with this frame's capture, so it is
     // normally already done and this returns immediately (core 0 is not stalled). The 3-deep camera
     // ring keeps cam_buf valid until long after the previous blit completed.
     if (s_done && xSemaphoreTake(s_done, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "previous PPA blit did not finish in 100 ms; dropping frame");
+        return;
+    }
+    if (s_paused) { // pause raised during the wait -> hand the FB to LVGL, do not submit
+        xSemaphoreGive(s_done);
         return;
     }
 
@@ -116,4 +121,19 @@ void ppa_display_blit(const uint8_t *cam_buf, uint32_t cam_w, uint32_t cam_h)
         }
     }
     // PPA writes the FB via DMA (concurrently with capture); the DSI scans it via DMA.
+}
+
+void ppa_display_pause(void)
+{
+    s_paused = true; // new blits skip immediately (they check s_paused before taking s_done)
+    // Drain a possibly in-flight blit: wait for its completion callback to give s_done, then release.
+    // After this returns, no PPA DMA is touching the FB, so the LVGL task may safely render over it.
+    if (s_done && xSemaphoreTake(s_done, pdMS_TO_TICKS(200)) == pdTRUE) {
+        xSemaphoreGive(s_done);
+    }
+}
+
+void ppa_display_resume(void)
+{
+    s_paused = false;
 }

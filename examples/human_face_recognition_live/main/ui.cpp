@@ -262,44 +262,116 @@ static void stats_timer_cb(lv_timer_t *timer)
 }
 
 #if USE_PPA_DISPLAY
-// ---- Increment-1 PPA coexistence spike UI ----
-// PPA owns the TOP camera region; LVGL draws ONLY this bottom chrome strip (rows >= PPA_CAM_H).
-// A live-updating label here, shown alongside the live PPA camera above, is the coexistence proof.
-static lv_obj_t *s_spike_lbl = nullptr;
+// ---- PPA full UI (productionization increment A) ----
+// PPA owns the camera rect (top PPA_CAM_H rows); LVGL owns the bottom band (buttons + status), which
+// never overlaps it, so PPA writes the camera uncontested. The punch card is a MODAL overlay shown via
+// ppa_display_pause() (which drains the in-flight blit so LVGL can own the whole FB) and hidden via
+// ppa_display_resume(). The R&D dashboard / thumbnail are deferred to a later increment.
+static lv_obj_t *s_ppa_status = nullptr;
 
-static void spike_stats_timer_cb(lv_timer_t *timer)
+static void ppa_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-    if (!s_spike_lbl) {
-        return;
-    }
     static pipeline_stats_t s;
     face_processor_get_stats(&s);
-    static char b[120];
-    snprintf(b, sizeof(b), "FPS %.0f   cap %.0f   det %.0f   rec %.0f   disp %.1f   C0 %.0f%% C1 %.0f%%",
-             s.fps, s.cap_ms, s.det_ms, s.rec_ms, s.disp_ms, s.load_core0, s.load_core1);
-    lv_label_set_text(s_spike_lbl, b);
+    if (s_ppa_status) {
+        static char b[88];
+        snprintf(b, sizeof(b), "%s %dx%d   FPS %.0f   rec %.0f ms   DB %d", s.det_model, s.model_in_w,
+                 s.model_in_h, s.fps, s.rec_ms, s.db_count);
+        lv_label_set_text(s_ppa_status, b);
+    }
+
+    if (!s_punch_card) {
+        return;
+    }
+    if (!s_card_showing) {
+        punch_event_t p;
+        const uint16_t *thumb = nullptr;
+        if (face_processor_get_punch(&p, &thumb)) {
+            char b[48];
+            snprintf(b, sizeof(b), "ID %d    sim %.2f", p.id, p.sim);
+            lv_label_set_text(s_punch_id, b);
+            time_t e = (time_t)p.epoch;
+            struct tm tmv;
+            gmtime_r(&e, &tmv);
+            char ts[40];
+            strftime(ts, sizeof(ts), "%Y-%m-%d  %H:%M:%S UTC", &tmv);
+            lv_label_set_text(s_punch_time, ts);
+            snprintf(b, sizeof(b), "Distance %d mm", p.dist_mm);
+            lv_label_set_text(s_punch_dist, b);
+            ppa_display_pause(); // drain in-flight blit -> LVGL safely owns the whole FB for the card
+            lv_obj_clear_flag(s_punch_card, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(s_punch_card);
+            s_card_showing = true;
+            s_card_since = lv_tick_get();
+        }
+    } else if (lv_tick_elaps(s_card_since) > PUNCH_CARD_MS) {
+        lv_obj_add_flag(s_punch_card, LV_OBJ_FLAG_HIDDEN);
+        s_card_showing = false;
+        ppa_display_resume(); // PPA resumes writing the camera region
+        face_processor_punch_consumed();
+    }
 }
 
-static void ui_init_spike(void)
+static void ui_init_ppa(void)
 {
     lvgl_port_lock(0);
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
-    lv_obj_t *title = lv_label_create(scr);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-    lv_label_set_text(title, "PPA SPIKE  -  camera above = PPA,  this line = LVGL");
-    lv_obj_align(title, LV_ALIGN_BOTTOM_LEFT, 12, -78);
+    // Bottom chrome band (rows >= PPA_CAM_H): 6 control buttons (2x3) + status. Non-overlapping with
+    // the PPA camera rect above.
+    char b[24];
+    make_button(scr, "ENROLL", LV_ALIGN_BOTTOM_LEFT, 12, -72, enroll_btn_cb);
+    make_button(scr, "CLEAR DB", LV_ALIGN_BOTTOM_LEFT, 224, -72, clear_btn_cb);
+    snprintf(b, sizeof(b), "RNG:%s", face_processor_range_name());
+    s_range_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 436, -72, range_btn_cb);
+    snprintf(b, sizeof(b), "DET:%s", face_processor_det_model_name());
+    s_det_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 12, -10, det_btn_cb);
+    snprintf(b, sizeof(b), "REC:%s", face_processor_feat_model_name());
+    s_rec_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 224, -10, rec_btn_cb);
+    snprintf(b, sizeof(b), "SPF:%s", face_processor_spoof_name());
+    s_spoof_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 436, -10, spoof_btn_cb);
 
-    s_spike_lbl = lv_label_create(scr);
-    lv_obj_set_style_text_color(s_spike_lbl, lv_color_hex(0x66ff66), 0);
-    lv_obj_set_style_text_font(s_spike_lbl, &lv_font_montserrat_20, 0);
-    lv_label_set_text(s_spike_lbl, "warming up...");
-    lv_obj_align(s_spike_lbl, LV_ALIGN_BOTTOM_LEFT, 12, -40);
-    lv_timer_create(spike_stats_timer_cb, 300, nullptr);
+    s_ppa_status = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_ppa_status, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_ppa_status, &lv_font_montserrat_16, 0);
+    lv_label_set_text(s_ppa_status, "starting...");
+    lv_obj_align(s_ppa_status, LV_ALIGN_BOTTOM_RIGHT, -8, -100);
 
+    // Punch card (text-only; centred over the camera). Shown via the pause handoff on a fresh match.
+    s_punch_card = lv_obj_create(scr);
+    lv_obj_set_size(s_punch_card, 320, 150);
+    lv_obj_align(s_punch_card, LV_ALIGN_CENTER, 0, -40);
+    lv_obj_set_style_bg_color(s_punch_card, lv_color_hex(0x0e2a16), 0);
+    lv_obj_set_style_bg_opa(s_punch_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_punch_card, lv_color_hex(0x33ff88), 0);
+    lv_obj_set_style_border_width(s_punch_card, 3, 0);
+    lv_obj_set_style_radius(s_punch_card, 10, 0);
+    lv_obj_clear_flag(s_punch_card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *phdr = lv_label_create(s_punch_card);
+    lv_label_set_text(phdr, LV_SYMBOL_OK " PUNCH");
+    lv_obj_set_style_text_color(phdr, lv_color_hex(0x66ff99), 0);
+    lv_obj_set_style_text_font(phdr, &lv_font_montserrat_24, 0);
+    lv_obj_align(phdr, LV_ALIGN_TOP_MID, 0, 4);
+    s_punch_id = lv_label_create(s_punch_card);
+    lv_obj_set_style_text_color(s_punch_id, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_punch_id, &lv_font_montserrat_20, 0);
+    lv_obj_align(s_punch_id, LV_ALIGN_TOP_MID, 0, 44);
+    lv_label_set_text(s_punch_id, "");
+    s_punch_time = lv_label_create(s_punch_card);
+    lv_obj_set_style_text_color(s_punch_time, lv_color_hex(0xcfe8ff), 0);
+    lv_obj_set_style_text_font(s_punch_time, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_punch_time, LV_ALIGN_TOP_MID, 0, 80);
+    lv_label_set_text(s_punch_time, "");
+    s_punch_dist = lv_label_create(s_punch_card);
+    lv_obj_set_style_text_color(s_punch_dist, lv_color_hex(0xcfe8ff), 0);
+    lv_obj_set_style_text_font(s_punch_dist, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_punch_dist, LV_ALIGN_TOP_MID, 0, 108);
+    lv_label_set_text(s_punch_dist, "");
+    lv_obj_add_flag(s_punch_card, LV_OBJ_FLAG_HIDDEN);
+
+    lv_timer_create(ppa_timer_cb, 200, nullptr); // ~5 Hz: status line + punch-card poll
     lvgl_port_unlock();
 }
 #endif // USE_PPA_DISPLAY
@@ -307,7 +379,7 @@ static void ui_init_spike(void)
 void ui_init(void)
 {
 #if USE_PPA_DISPLAY
-    ui_init_spike();
+    ui_init_ppa();
     return;
 #endif
     lvgl_port_lock(0);

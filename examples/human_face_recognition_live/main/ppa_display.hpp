@@ -24,11 +24,12 @@
  */
 #define USE_PPA_DISPLAY 1
 
-// Camera region inside the 1024x600 panel framebuffer. Top area; chrome strip is below it.
+// Camera region inside the 1024x600 panel framebuffer. Top area; the bottom band is the LVGL
+// chrome (buttons + status), which never overlaps this rect so PPA owns it uncontested.
 #define PPA_CAM_X 0
 #define PPA_CAM_Y 0
 #define PPA_CAM_W 1024
-#define PPA_CAM_H 480 // top 480 of 600 rows; bottom 120 px = LVGL chrome strip
+#define PPA_CAM_H 440 // top 440 of 600 rows; bottom 160 px = LVGL chrome band (2 button rows + status)
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,6 +41,13 @@ esp_err_t ppa_display_init(void);
 // Blit one camera frame (cam_w x cam_h, RGB565-layout / BGR565 from the SC2336) into the panel
 // FB camera region via PPA (byte-swap + R/B swap in hardware). No draw_bitmap, no LVGL contention.
 void ppa_display_blit(const uint8_t *cam_buf, uint32_t cam_w, uint32_t cam_h);
+
+// Pause/resume the camera blits so LVGL can render a full-screen modal (punch card, menu) over the
+// whole framebuffer. ppa_display_pause() DRAINS any in-flight blit (waits on the completion semaphore)
+// before returning, so LVGL never writes the FB while a PPA DMA is mid-flight (cross-core tear-safe).
+// Call pause() from the LVGL task before showing the overlay, resume() after hiding it.
+void ppa_display_pause(void);
+void ppa_display_resume(void);
 
 #ifdef __cplusplus
 }
