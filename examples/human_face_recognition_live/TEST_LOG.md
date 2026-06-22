@@ -14,6 +14,119 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 014 — 2026-06-22 · YuNet+MBF display-off — completes the 2×2 matrix; best margins
+**Build:** same probe binary (`DISPLAY_PROBE_NO_FLUSH=1`). Switched to YuNet+MBF, cleared + re-enrolled 3.
+**Result: same display-bound story; YuNet+MBF is the best-accuracy combo.**
+
+| combo (display flush OFF) | det ms | rec ms | fps | load0 | load1 |
+|---|---|---|---|---|---|
+| YuNet+MBF (this) | 56–69 | 208–230 | 27–30 | 3–23 | 48–92 |
+
+fps holds ~30 on the **heaviest** combo (YuNet det + MBF rec); core 0 idle (3–23%), core 1 busy but never
+pegged (90–92% peaks during enroll+recognize). rec ~219 ms vs 320–372 display-on (Test 008) = same ~⅓ speedup.
+**Accuracy = best of all four** (MBF margins, as expected): genuine id1 0.82–0.90 / id2 0.85–0.92 / id3
+0.92–0.94; cross-identity (`2nd`) **0.07–0.24**; margins **0.72–0.79**; impostor/off-angle REJECT (0.10–0.26);
+punches correct for all 3.
+
+**2×2 MATRIX COMPLETE (all display-off, ~30 fps cap):** MSRMNP+MFN 30 · YuNet+MFN 28–30 · MSRMNP+MBF 27–30 ·
+YuNet+MBF 27–30. **Across every combo: the display path is the sole fps cap, ~30 fps is reachable, accuracy is
+clean, memory is leak-free.** The probe has now told us everything it can — next step is a build track (PPA
+coexistence spike, or the punch/employee store), not more measurement.
+
+---
+
+## Test 013 — 2026-06-22 · MSRMNP+MBF display-off + cross-build finding: the flush also taxes AI latency
+**Build:** same probe binary (`v3.3.5-37-g9d6c10f-dirty`, `DISPLAY_PROBE_NO_FLUSH=1`). Switched recognizer→MBF,
+enrolled 2 people. **Result: fps holds 27–30 even with MBF (rec ~220 ms); accuracy clean; recognition is ~⅓
+FASTER than display-on.**
+
+| combo (display flush OFF) | det ms | rec ms | fps | load0 | load1 |
+|---|---|---|---|---|---|
+| MSRMNP+MBF (this) | 17–21 | 219–227 | 27–30 | 14–37 | 26–92 |
+
+**Cross-build finding (vs Test 008, display ON):** rec MBF **320–372 → ~220 ms (−33%)**, det MSRMNP **32–53 → 17
+ms (−~50%)**. The full-screen `lv_refr_now` flush (RGB565 byte-swap of a 1024×600 framebuffer) was **contending
+for PSRAM bandwidth** with the AI task on core 1 (det/rec stream weights + the camera image from PSRAM). So PPA
+removing that flush buys **not just fps but ~1.5–2× faster det+rec too** — a second, independent win. (Caveat:
+cross-build comparison; the ratio is consistent across MFN/MBF/MSRMNP/YuNet, so the effect is real.)
+**Accuracy clean (thr 0.62/mgn 0.06):** id2 genuine 0.89–0.95 (`2nd`=1/0.19, mgn ~0.75), id1 0.62–0.83
+(`2nd`=2/0.18), impostor 0.14–0.20 REJECT, punches correct.
+**Long-run stability:** fps pinned **30.0 for 3+ min** idle at db=10, MBF rec steady 219 ms, internal/PSRAM flat
+(261 KB / 12.3 MB — **no leak**), cores ~23%/33%. `cap` jitters bimodally 16↔33 ms (V4L2 buffer cadence) but
+averaged fps holds 30 — all-day-kiosk stable.
+**Enroll gotcha:** many frames `skip` (tw=30–47 < `Q_MIN_TENSOR_FACE_W=50`) — MSRMNP's 160-px input over a Med
+(640) crop shrinks a stood-back face's tensor width below the gate, so MBF/MSRMNP enroll needs the subject
+closer. YuNet's 256-px input cleared the gate easily (Test 012). Storage: punches are NOT persisted yet (live
+card + serial only); face DB = 1 MB FAT partition, 2048 B/template at feat_len=512 (see benchmark/sizing notes).
+
+---
+
+## Test 012 — 2026-06-22 · Production-combo ceiling confirmation (YuNet+MFN, display-off) — caveat removed
+**Build:** same probe binary as Test 011 (`v3.3.5-37-g9d6c10f-dirty`, `DISPLAY_PROBE_NO_FLUSH=1`, disp=0). On
+the running probe: switched detector→YuNet (DET button), enrolled 3 people (15 templates), ran live recognition
++ punch. **Result: the REAL production pipeline is display-bound too — fps holds ~28–30 with full AI load.**
+
+| combo (display flush STUBBED) | fps | det ms | rec ms | load0 | load1 |
+|---|---|---|---|---|---|
+| MSRMNP+MFN, empty (Test 011) | 30.0 | 17 | — | ~24% | ~27% |
+| **YuNet+MFN, 3 enrolled, recognizing** | **28–30** | 56–63 | 105–117 | **10–24%** | 46–93% |
+
+- det cost 17→57 ms + live MFN rec + 15-template DB → **fps barely moved (30 → ~29)**; core 0 (capture) stays
+  ~80% IDLE. Confirms fps is NOT AI-bound — the heavy work is on core 1 in parallel and never gates fps.
+- core 1 carries the AI: 50–65% typical, brief **84–93% peaks** during simultaneous enroll+recognize — busy
+  but not pegged. **Recognition cadence, not fps, is what core 1 gates** (the two are decoupled).
+- **Accuracy clean (thr 0.62/mgn 0.06), consistent with Test 007:** genuine id1 0.62–0.93 / id2 0.88–0.94 /
+  id3 0.95–0.97; cross-identity (`2nd`) 0.18–0.33; impostor/off-angle correctly REJECTED (0.25–0.41); PUNCH
+  fired correctly for all 3 ids. Transient genuine dips→REJECT on turn/blur = probe robustness, not a bug.
+
+**Conclusion: removes the last caveat on Test 011's PPA GO.** The shipping config (YuNet+MFN, not just the light
+MSRMNP probe) is display-bound, so PPA's ~3× headroom applies to production. **Design note for PPA:** fps will be
+core-0/PPA-bound, recognition rate core-1/AI-bound — independent. (YuNet+MBF, rec ~330 ms, untested — would load
+core 1 harder and may throttle rec cadence, but fps stays core-0-bound.) **NEXT unchanged:** increment-1
+LVGL-chrome + PPA-camera coexistence spike. (Board currently runs the probe binary; rebuild+flash the reverted
+source to restore a normal display build.)
+
+---
+
+## Test 011 — 2026-06-22 · Capture-ceiling probe (PPA go/no-go GATE) → **PPA GO**
+**Build:** `v3.3.5-37-g9d6c10f-dirty` (`DISPLAY_PROBE_NO_FLUSH=1` → `ui_update_camera_canvas` early-returns;
+display FROZEN — expected, no camera output). MSRMNP+MFN, Med range, empty DB. Numbers read off the ~1 Hz
+`BENCH` serial line (the panel is frozen, but BENCH prints from the AI task on core 1). **Result: DECISIVE.**
+
+| metric | Test 010 (display ON, keeper) | Test 011 (flush STUBBED) |
+|---|---|---|
+| FPS | ~9.0–9.4 | **30.0 (steady, locked)** |
+| cap ms | ~21–33 | 33.3 (= 1000/30 = camera cap) |
+| disp ms | 60–78 | **0.0** (flush gone) |
+| draw ms | ~0 | 0.0 |
+| det ms (MSRMNP, core 1) | ~17 | ~17 |
+| load core0 | core-0 bound | **23–27%** |
+| load core1 | — | **26–29%** |
+
+Same-combo apples-to-apples: MSRMNP+MFN was **8.0–9.7 fps with the display ON** (Test 008) → **30.0 with the
+flush removed = 3.3×**. `cap=33.3 ms` means we hit the SC2336's configured **30 fps cap exactly**; both cores
+sit **~75% IDLE** → capture+AI are nowhere near the limit. The display flush (`lv_refr_now` = LVGL render +
+RGB565 byte-swap + DSI push, ~60–78 ms ≈ ⅔ of the frame budget) **IS the bottleneck, beyond doubt.**
+
+**DECISION: PPA GO.** Removing one core-0 display pass moved FPS 9 → 30 — the gate's "~15–30 → PPA worth it"
+branch, and we hit the TOP of it (the camera cap). Idle headroom on BOTH cores means even the heavier production
+combo (YuNet det ~90 ms / MBF rec ~330 ms, throttled, on core 1) should lift substantially — core 1 was ~74%
+idle here and Test 008 showed FPS flat across a 9× detector swing.
+
+**GO means: build the smallest COEXISTENCE SPIKE first — NOT the full pipeline rewrite.** The probe proved the
+*prize* is real (9→30) but did NOT touch the *risk*: can an LVGL chrome layer and a PPA-blitted camera region
+share the DSI panel, given esp_lvgl_port owns the panel today? That integration, debugged blind (user is the
+only eyes), is the multi-day risk and is 100% unaddressed by stubbing the flush. So increment 1 = one static
+LVGL chrome element + one PPA SRM blit of the camera region to the DSI FB (`esp_lcd_dpi_panel_get_frame_buffer`,
+`num_fbs`=2), shown together — success = user sees chrome AND camera, no tearing/panel-fight. If they can't
+coexist, we learn it day 1, not day 4. Then expand to the full composite (IMPROVEMENT_PLAN Phase 3, LVGL→
+chrome-only). **30 fps is the CEILING, not the deliverable** — PPA leaves residual core-0 cost (blit trigger +
+chrome composite), so the honest target is "well above 9, approaching 30." Probe reverted; keeper `v3.3.5-37`
+clean. Optional/lower-priority: YuNet+MBF + enrolled re-probe (the core-independence argument + Test 008 already
+answer the production-combo ceiling — don't lead with it).
+
+---
+
 ## Test 010 — 2026-06-19 · Speed inc 3 (mirror OFF) — first real FPS win (+20%, steady); kept
 **Build:** `v3.3.5-35-gb5ef9ce` (`DISPLAY_MIRROR_X=0`). **Result: kept.**
 | metric | inc 1 (mirror on) | inc 3 (mirror off) |
