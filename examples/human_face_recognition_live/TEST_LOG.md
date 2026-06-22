@@ -14,6 +14,18 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 022 — 2026-06-22 · Task C: split range gates → recognition to ~1.2 m, enroll stays tight ✅
+**Build:** `v3.3.5-45+` (`f9b04df`; `Q_MIN_TENSOR_FACE_W` split → ENROLL=50, RECOG=30; tensor-width pulled out
+of `score_face().ok`, applied per-path). Recognition PUNCHes now fire at **dist = 960 / 1140 / 1190 mm**
+(genuine sim 0.83–0.86 at >1 m, 0.79 at 1.19 m) — previously silent past ~600–700 mm. Close range still clean
+(0.94–0.96 @ ~450 mm). **Enroll gate held TIGHT:** every far frame (tw 33–45) `-> skip`, only close (tw 51–58)
+`-> keep` → no template poisoning (the advisor's guardrail). fps 30, no storm; per-resolution DBs persisted
+across reboot (YuNet256 = 3 people/15 templates loaded). **Exceeds the 1 m target (~1.2 m).** Some far frames
+dip 0.55–0.62 → intermittent reject (fine for a hold-still punch; per-site drop accept 0.62→0.55 if far matches
+must accept harder). **All 3 asks (PPA full UI · YuNet switching · range) COMPLETE.**
+
+---
+
 ## Test 021 — 2026-06-22 · Full live YuNet sweep (128/256/384/512) on the PRODUCTIONIZED PPA full UI
 **Build:** `v3.3.5-43+` = PPA full UI (increment A, `784ac47`) + runtime YuNet switch (increment B, `1cabaa7`).
 All 7 detectors selectable via DET; full app (buttons + status + punch card) at 30 fps.

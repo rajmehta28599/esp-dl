@@ -51,7 +51,7 @@ the watchdog storm the LVGL full-UI path hit.
 | # | Test | Measure | Pass bar | Status |
 |---|---|---|---|---|
 | T1 | Recognition accuracy | TAR/FAR over 5–10 people, multiple sessions (YuNet256+MFN, thr 0.62/mgn 0.06) | TAR ≥95 %, FAR ≈0 | 🟡 spot-checks clean; needs formal N-person run |
-| T2 | Operating range | min/max distance recognition holds | ~250 mm → ~1000 mm | 🟡 256 seen to 600 mm; widen to 1 m = task C |
+| T2 | Operating range | min/max distance recognition holds | ~250 mm → ~1 m | ✅ recognition to ~1.2 m (Test 022, enroll/recog gates split); enroll stays tight |
 | T3 | Lighting robustness | low/normal/bright/backlit + multi-template enroll | works except harsh backlight | ⬜ |
 | T4 | Multi-person in frame | correct largest-face pick, no cross-accept | right id, others rejected | 🟡 2-face frames seen |
 | T5 | Soak / stability | 1–4 h; punch card shown 100s of times | no leak/hang/desync/tear | 🟡 minutes clean |
@@ -85,7 +85,7 @@ the watchdog storm the LVGL full-UI path hit.
 
 ## 6. Remaining work (priority)
 
-1. **Range to ~1 m** (task C) — widen recognition (threshold separate from the enroll gate); keep enroll tight.
+1. ~~Range to ~1 m (task C)~~ ✅ **DONE (Test 022)** — enroll/recog gates split; recognition to ~1.2 m, enroll tight.
 2. **Employee + punch store** — persist `{empID(u32), name[30], empCode(u32), reg_unix, punch_unix}`; grow the
    storage partition (1 MB → ~6 MB).
 3. **Accuracy + lighting formalization** (T1/T3) — multi-template enroll, N-person TAR/FAR.
