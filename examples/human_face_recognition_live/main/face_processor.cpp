@@ -107,15 +107,21 @@ typedef struct {
     det_kind_t kind;
     HumanFaceDetect::model_type_t hfd_type; // used only when kind == DET_KIND_HFD
     const char *name;
-    bool has_kp; // provides 5-pt landmarks? ESPDet does not -> recognition disabled while active
+    bool has_kp;  // provides 5-pt landmarks? ESPDet does not -> recognition disabled while active
+    int yunet_w;  // YuNet input width (128/256/384/512); 0 for non-YuNet
 } det_model_cfg_t;
 static const det_model_cfg_t DET_MODELS[] = {
-    // The two recognition-capable detectors (have 5 landmarks) are first/adjacent, so the DET
-    // button toggles MSRMNP <-> YuNet in one tap. ESPDet (detection-only) follows.
-    {DET_KIND_HFD, HumanFaceDetect::MSRMNP_S8_V1, "MSRMNP", true},
-    {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet", true}, // YuNet emits 5 landmarks
-    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_224_224_FACE, "ESPDet224", false},
-    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_416_416_FACE, "ESPDet416", false},
+    // Recognition-capable detectors (5 landmarks): MSRMNP + the 4 YuNet resolutions, kept adjacent so
+    // the DET button sweeps MSRMNP -> YuNet128 -> 256 -> 384 -> 512. ESPDet (detect-only) follows. Each
+    // YuNet resolution keeps its OWN per-name DB (persons_<REC>_YuNetNNN.bin) so enrollments at different
+    // resolutions don't confound the comparison.
+    {DET_KIND_HFD, HumanFaceDetect::MSRMNP_S8_V1, "MSRMNP", true, 0},
+    {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet128", true, 128},
+    {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet256", true, 256},
+    {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet384", true, 384},
+    {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet512", true, 512},
+    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_224_224_FACE, "ESPDet224", false, 0},
+    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_416_416_FACE, "ESPDet416", false, 0},
 };
 #define DET_MODEL_COUNT ((int)(sizeof(DET_MODELS) / sizeof(DET_MODELS[0])))
 
@@ -123,7 +129,7 @@ static const det_model_cfg_t DET_MODELS[] = {
 static dl::detect::Detect *make_detector(int idx)
 {
     if (DET_MODELS[idx].kind == DET_KIND_YUNET) {
-        return new YuNetDetect(); // score/nms/top_k defaults; tune in yunet_detect.cpp
+        return yunet_make(DET_MODELS[idx].yunet_w); // 128/256/384/512; each keeps its own per-name DB
     }
     HumanFaceDetect *h = new HumanFaceDetect(DET_MODELS[idx].hfd_type);
     h->set_score_thr(DETECT_SCORE_THR, 0);

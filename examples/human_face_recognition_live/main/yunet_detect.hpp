@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "dl_detect_base.hpp"
 
 // YuNet face detector, ported to esp-dl via ESP-PPQ (see ../../../yunet_port/).
@@ -16,7 +17,9 @@
 // omitted (esp-dl can't load an empty [0] roi tensor).
 class YuNetDetect : public dl::detect::Detect {
 public:
-    YuNetDetect(float score_thr = 0.5f, float nms_thr = 0.3f, int top_k = 10);
+    // model_espdl = an embedded .espdl symbol; model_w/model_h = its input size (4:3, both /32).
+    YuNetDetect(const uint8_t *model_espdl, int model_w, int model_h, float score_thr = 0.5f,
+                float nms_thr = 0.3f, int top_k = 10);
     ~YuNetDetect();
 
     std::list<dl::detect::result_t> &run(const dl::image::img_t &img) override;
@@ -29,5 +32,9 @@ private:
     dl::image::ImagePreprocessor *m_pre = nullptr;
     float m_score_thr, m_nms_thr;
     int m_top_k;
+    int m_w, m_h; // model input resolution (W x H)
     std::list<dl::detect::result_t> m_results;
 };
+
+// Build a YuNet detector at one of the embedded input widths (128/256/384/512; H = W*3/4).
+YuNetDetect *yunet_make(int width);

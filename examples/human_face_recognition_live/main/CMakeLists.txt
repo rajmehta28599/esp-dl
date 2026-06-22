@@ -10,4 +10,4 @@ idf_component_register(
              lvgl
              esp_driver_ppa
              esp_mm
-    EMBED_FILES "human_face.jpg" "yunet_256x192_p4.espdl" "yunet_384x288_p4.espdl" "yunet_128x96_p4.espdl")
+    EMBED_FILES "human_face.jpg" "yunet_256x192_p4.espdl" "yunet_384x288_p4.espdl" "yunet_128x96_p4.espdl" "yunet_512x384_p4.espdl")

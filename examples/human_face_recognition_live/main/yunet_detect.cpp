@@ -15,29 +15,14 @@ using namespace dl::detect;
 
 static const char *TAG = "yunet";
 
-// Embedded quantized model(s) — both 4:3 (match the 4:3 camera crop -> no aspect distortion).
-// YUNET_USE_384: resolution A/B study (NEXT_STEPS section A). 1 = 384x288 (bigger: more range +
-// sharper landmarks, affordable now that PPA freed core 1); 0 = 256x192 (committed default). Both
-// dims /32 so the decode (cols=W/s, rows=H/s) is unchanged — 256x192 grids 32x24/16x12/8x6 = 768/192/48;
-// 384x288 grids 48x36/24x18/12x9 = 1728/432/108.
-// YuNet input-resolution selector (study, NEXT_STEPS A). Valid 4:3 + /32 sizes: 128, 256, 384, 512.
-// Findings: 256 = clean baseline (Test 007/012); 384 = too heavy (TWDT overload, Test 019); 512 strictly
-// worse than 384 -> skip; 128 = lightest, for the COMPACT CLOSE-RANGE device. Set to 128 / 256 / 384.
-#define YUNET_RES 256 // LOCKED (Test 020): 256 = sweet spot. 128 recognition too noisy (coarse landmarks
-                       // -> genuine 0.51-0.88 + REJECTs); 384 too heavy (overload); 512 ruled out. 256 wins.
-#if YUNET_RES == 128
-extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_128x96_p4_espdl_start");
-#define YUNET_W 128
-#define YUNET_H 96
-#elif YUNET_RES == 384
-extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_384x288_p4_espdl_start");
-#define YUNET_W 384
-#define YUNET_H 288
-#else // 256 = baseline default
-extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_256x192_p4_espdl_start");
-#define YUNET_W 256
-#define YUNET_H 192
-#endif
+// Embedded quantized models — all 4:3 (match the 4:3 camera crop -> no aspect distortion) + both dims
+// /32 (clean decode grid). Runtime-selectable via the DET cycle (yunet_make() below): 128/256/384/512.
+// 256 = recommended sweet spot (Test 020); 128 lighter but recognition noisier; 384/512 heavier and only
+// the PPA display path runs them without overloading core 0.
+extern const uint8_t g_yunet_128[] asm("_binary_yunet_128x96_p4_espdl_start");
+extern const uint8_t g_yunet_256[] asm("_binary_yunet_256x192_p4_espdl_start");
+extern const uint8_t g_yunet_384[] asm("_binary_yunet_384x288_p4_espdl_start");
+extern const uint8_t g_yunet_512[] asm("_binary_yunet_512x384_p4_espdl_start");
 static const int STRIDES[3] = {8, 16, 32}; // anchor-free detection strides
 
 static inline float clamp01(float v)
@@ -45,15 +30,28 @@ static inline float clamp01(float v)
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
-YuNetDetect::YuNetDetect(float score_thr, float nms_thr, int top_k) :
-    m_score_thr(score_thr), m_nms_thr(nms_thr), m_top_k(top_k)
+YuNetDetect::YuNetDetect(const uint8_t *model_espdl, int model_w, int model_h, float score_thr,
+                         float nms_thr, int top_k) :
+    m_score_thr(score_thr), m_nms_thr(nms_thr), m_top_k(top_k), m_w(model_w), m_h(model_h)
 {
-    m_model = new Model((const char *)g_yunet_espdl, fbs::MODEL_LOCATION_IN_FLASH_RODATA);
+    m_model = new Model((const char *)model_espdl, fbs::MODEL_LOCATION_IN_FLASH_RODATA);
     m_model->minimize();
     // YuNet wants RAW 0-255 BGR: mean 0 / std 1 => no normalization. rgb_swap=false keeps the
     // camera's BGR order. If YuNet never detects, the colour order is the first thing to flip.
     m_pre = new image::ImagePreprocessor(m_model, {0, 0, 0}, {1, 1, 1}, false);
-    ESP_LOGI(TAG, "YuNet loaded (input %dx%d)", YUNET_W, YUNET_H);
+    ESP_LOGI(TAG, "YuNet loaded (input %dx%d)", m_w, m_h);
+}
+
+// Map an input width to the matching embedded model (4:3, so H = W*3/4). Used by the DET cycle.
+YuNetDetect *yunet_make(int width)
+{
+    switch (width) {
+    case 128: return new YuNetDetect(g_yunet_128, 128, 96);
+    case 384: return new YuNetDetect(g_yunet_384, 384, 288);
+    case 512: return new YuNetDetect(g_yunet_512, 512, 384);
+    case 256:
+    default: return new YuNetDetect(g_yunet_256, 256, 192);
+    }
 }
 
 YuNetDetect::~YuNetDetect()
@@ -120,7 +118,7 @@ std::list<result_t> &YuNetDetect::run(const dl::image::img_t &img)
 
     for (int si = 0; si < 3; si++) {
         const int s = STRIDES[si];
-        const int cols = YUNET_W / s; // rows = YUNET_H/s implied via num = rows*cols
+        const int cols = m_w / s; // rows = m_h/s implied via num = rows*cols
         char n_cls[8], n_obj[8], n_box[8], n_kps[8];
         snprintf(n_cls, sizeof(n_cls), "cls_%d", s);
         snprintf(n_obj, sizeof(n_obj), "obj_%d", s);
