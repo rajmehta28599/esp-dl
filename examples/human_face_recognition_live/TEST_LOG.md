@@ -14,6 +14,28 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 021 — 2026-06-22 · Full live YuNet sweep (128/256/384/512) on the PRODUCTIONIZED PPA full UI
+**Build:** `v3.3.5-43+` = PPA full UI (increment A, `784ac47`) + runtime YuNet switch (increment B, `1cabaa7`).
+All 7 detectors selectable via DET; full app (buttons + status + punch card) at 30 fps.
+
+**HEADLINE: every detector holds fps = 30 with NO `task_wdt` storm** — PPA frees core 0 (load0 ~6–30%), so
+detection cost lands on core 1 as latency, never dropped frames. **The 384/512 "overload" from Tests 019/020
+was purely the LVGL display path saturating core 0 — gone on the PPA path.** Punch-card pause-handoff ran clean
+across many punches over a ~7-min run (no tear/hang/crash) → increment A validated.
+
+| YuNet | det ms | core1 % | genuine sim | enroll | note |
+|---|---|---|---|---|---|
+| 128×96 | ~15 | 27–35 | 0.82–0.90 (≤350 mm) | **HARD** (tensor tw 31–46 < 50 gate) | lightest, noisier |
+| **256×192** | ~60 | 50–89 | **0.91–0.95** (to 600 mm) | easy (tw~58) | ★ WINNER |
+| 384×288 | ~150 | 57–92 | 0.82–0.94 | very easy | heavier, no gain |
+| 512×384 | ~290 | 78–96 | 0.71–0.95 | very easy | heaviest, no gain |
+
+**256×192 confirmed best** across the full live sweep — cleanest recognition + snappy (~6 rec/s) + easy enroll.
+128 enroll-hard (small tensor face fails the enroll gate) + noisier; 384/512 viable on PPA but 2.5–5× det cost
+for no quality gain. Full table report + validation/use-case plan → `PPA_BENCHMARK_REPORT.md`.
+
+---
+
 ## Test 020 — 2026-06-22 · YuNet 128×96 study (too noisy) → 256 LOCKED; LVGL full-UI path TWDT-storms
 **Build:** `v3.3.5-40` + `yunet_128x96` (full UI, db=20). **128×96: lightest (det ~38–44 ms) but recognition
 NOISIER.** At close range (300–440 mm): genuine 0.51–0.88 (vs 256's tight 0.62–0.97), several REJECTs at
