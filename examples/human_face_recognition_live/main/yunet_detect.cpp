@@ -15,13 +15,29 @@ using namespace dl::detect;
 
 static const char *TAG = "yunet";
 
-// Embedded quantized model (main/CMakeLists EMBED_FILES "yunet_256x192_p4.espdl").
+// Embedded quantized model(s) — both 4:3 (match the 4:3 camera crop -> no aspect distortion).
+// YUNET_USE_384: resolution A/B study (NEXT_STEPS section A). 1 = 384x288 (bigger: more range +
+// sharper landmarks, affordable now that PPA freed core 1); 0 = 256x192 (committed default). Both
+// dims /32 so the decode (cols=W/s, rows=H/s) is unchanged — 256x192 grids 32x24/16x12/8x6 = 768/192/48;
+// 384x288 grids 48x36/24x18/12x9 = 1728/432/108.
+// YuNet input-resolution selector (study, NEXT_STEPS A). Valid 4:3 + /32 sizes: 128, 256, 384, 512.
+// Findings: 256 = clean baseline (Test 007/012); 384 = too heavy (TWDT overload, Test 019); 512 strictly
+// worse than 384 -> skip; 128 = lightest, for the COMPACT CLOSE-RANGE device. Set to 128 / 256 / 384.
+#define YUNET_RES 256 // LOCKED (Test 020): 256 = sweet spot. 128 recognition too noisy (coarse landmarks
+                       // -> genuine 0.51-0.88 + REJECTs); 384 too heavy (overload); 512 ruled out. 256 wins.
+#if YUNET_RES == 128
+extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_128x96_p4_espdl_start");
+#define YUNET_W 128
+#define YUNET_H 96
+#elif YUNET_RES == 384
+extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_384x288_p4_espdl_start");
+#define YUNET_W 384
+#define YUNET_H 288
+#else // 256 = baseline default
 extern const uint8_t g_yunet_espdl[] asm("_binary_yunet_256x192_p4_espdl_start");
-
-// 4:3 input (matches the 4:3 camera crop -> no aspect distortion). Non-square: cols=W/s,
-// rows=H/s; grids 32x24/16x12/8x6 = 768/192/48.
 #define YUNET_W 256
 #define YUNET_H 192
+#endif
 static const int STRIDES[3] = {8, 16, 32}; // anchor-free detection strides
 
 static inline float clamp01(float v)
