@@ -14,6 +14,98 @@ Baselines for comparison live in `BENCHMARK_REPORT.md`. Roadmap/phases in `IMPRO
 
 ---
 
+## Test 018 — 2026-06-22 · 30 FPS ACHIEVED — non-blocking PPA (speed track COMPLETE, 9→30 = 3.3×)
+**Build:** `v3.3.5-38` (3-buffer camera ring + non-blocking PPA + ISR completion semaphore). **Result: the full win.**
+
+| metric | LVGL keeper (T010) | PPA blocking (T015–17) | **PPA non-blocking (this)** |
+|---|---|---|---|
+| FPS | ~9 | 20 | **30.0 (locked)** |
+| disp ms | 60–78 | 22–25 | **0.1–0.4** (rare 5–10 spikes) |
+| cap ms | ~110 | 33/66 bimodal | **33.3 (no drops)** |
+| load0 / load1 | core-0 bound | 65 / 22 | **28–35 / 27–32** |
+
+**How:** `ppa_display_blit` now = take-semaphore + submit NON-BLOCKING + return; the ~22 ms PPA op runs
+concurrently with the next capture; `ppa_on_done` (ISR, `xSemaphoreGiveFromISR`) releases the semaphore. The
+3-deep camera ring keeps `cam_buf` valid ~66 ms ≫ the 22 ms blit, so no torn frames. Ran 47 s with **no
+`did not finish` / `submit failed` / crash**; color correct (0,0); PSRAM 12.3→11.2 MB (3rd ring buffer). Both
+cores ~70% idle → the pipeline is now camera-bound at 30 fps, exactly as predicted.
+
+**SPEED TRACK COMPLETE: 9 → 30 fps (3.3×) at correct color = the SC2336's hardware ceiling.** Beyond 30 needs a
+higher-fps sensor mode (panel caps ~56 Hz anyway). **REMAINING is productionizing, NOT speed:** (1) restore the
+full UI chrome (buttons / stats / punch card) over/around the PPA camera — the *overlay-coexistence* case the
+advisor flagged as harder than the spike's side-by-side layout; (2) re-add detection-box overlays (needs a
+per-buffer `esp_cache_msync` before each submit, since CPU-drawn boxes must reach PSRAM before the PPA DMA
+reads); (3) optional `num_fbs=2` for tearing (reopens "chrome in both buffers"). `USE_PPA_DISPLAY 0` = keeper.
+
+---
+
+## Test 017 — 2026-06-22 · PPA color SOLVED — working path: correct color + 20 fps + stable coexistence
+**Build:** `v3.3.5-38` (color-combo cycler). On-device cycle of the 4 `(byte_swap, rgb_swap)` combos → user
+confirmed **COMBO 0 `(byte_swap=0, rgb_swap=0)` renders CORRECT color**; (1,1)/(1,0)/(0,1) wrong. Locked it +
+removed the cycler. **The PPA path now also FIXES the R/B swap the LVGL canvas path always had** (cosmetic bug
+since the start — see [[face-demo-project]]).
+
+**Net state of the PPA path (increment 1 complete):** correct color · **~20 fps** (vs 9 on LVGL) · LVGL chrome
+coexists with the PPA camera · stable over minutes · tearing (num_fbs=1) not visually objectionable at 20 fps.
+**This is strictly better than the keeper on two axes** (2.2× fps AND correct color).
+
+**Decision point (user):**
+- **(A) Ship ~20 fps**, move to restoring the FULL UI chrome (buttons / stats / punch card) over/around the PPA
+  camera — note this is the *overlay-chrome* coexistence case the advisor flagged as harder + untested (LVGL
+  redrawing regions the PPA camera owns). The minimal spike UI proved side-by-side, not overlay.
+- **(B) Push ~30 fps** first via **non-blocking PPA** (overlap the 22 ms blit with the next capture) — the one
+  genuinely risky remaining piece (input-buffer lifecycle). 20→30 the kiosk doesn't strictly need.
+
+Recommendation: (A) — 20 fps is smooth for a kiosk and correct-color is the bigger UX win; treat 30 fps as
+optional later. Keeper stays `v3.3.5-37` (`USE_PPA_DISPLAY 0`).
+
+---
+
+## Test 016 — 2026-06-22 · PPA bisect: the 23 ms is the PPA op, not the cache flush; color = swap combo
+**Build:** `v3.3.5-38` (removed the per-frame ~960 KB `esp_cache_msync`). **Result: `disp` UNCHANGED at 22–25 ms,
+fps still 20** (cap bimodal 33/66, load0 65%). So the msync was NOT the cost — **the PPA SRM op itself is the
+~22 ms**: it reads ~1 MB (1024×480 camera) + writes ~1 MB (FB) per frame and is PSRAM-bandwidth bound (~86 MB/s
+effective), blocking core 0. 22 ms + ~10 ms other core-0 work intermittently exceeds the 33 ms camera period →
+every-other-frame drop → 20 fps.
+**Color:** user reports **(a) recognizable but WRONG colors** (not torn/smeared) → it's the `byte_swap`/`rgb_swap`
+combo (`1,1` is wrong), NOT tearing. Built a **self-cycling color-combo finder** (cycles the 4 combos ~every 3–4 s,
+announces each on serial as `COLOR COMBO n`) to identify the correct one in a single flash.
+**Speed lever confirmed = non-blocking PPA** (overlap the 22 ms op with the next capture; camera ring is ≥2
+buffers, enforced in bsp_camera.c). 20 fps is already smooth + 2.2× the 9 fps baseline — whether to invest in the
+risky non-blocking buffer-lifecycle path for 30 is a user call. Coexistence + stability remain solid.
+
+---
+
+## Test 015 — 2026-06-22 · PPA increment-1 coexistence spike — COEXISTENCE PROVEN, fps 9→20 (partial)
+**Build:** `v3.3.5-38-g983f2a2-dirty` (`USE_PPA_DISPLAY=1`). PPA SRM blits camera → top 1024×480 of the DSI FB
+directly (no draw_bitmap); LVGL draws a live stats line in the bottom strip. **Result: the architecture WORKS.**
+
+**THE DAY-1 GO/NO-GO = GO.** `ppa_disp: PPA display ready: fb=0x48910a80 (1228800 B)`, then ran **138+ s with
+zero hang / reboot / chrome corruption**; LVGL bottom chrome stayed live while PPA showed the camera on top. **The
+feared esp_lvgl_port trans-done desync did NOT occur** — direct-to-FB (not draw_bitmap) is the correct mechanism.
+
+| metric | LVGL keeper (Test 010) | PPA spike (this) |
+|---|---|---|
+| FPS | ~9 | **20.0** |
+| disp ms | 60–78 | **22–25** (PPA blit, BLOCKING, on core 0) |
+| cap ms | ~33 (1 drop) | **33 / 66 bimodal** = every-other-frame drop |
+| load0 | core-0 bound | 65% |
+
+**Why only 20, not 30:** `ppa_display_blit` blocks core 0 for ~23 ms = (a) a **~960 KB `esp_cache_msync`
+every frame** (added to flush CPU-drawn overlay boxes — wasteful: walks the whole region for a few box pixels)
++ (b) the **blocking PPA SRM** (reads ~1 MB camera + writes ~1 MB FB → PSRAM-bandwidth bound). 23 ms + other
+core-0 work intermittently exceeds the 33 ms camera period → drops every other frame → 20 fps.
+**Image "not clear" (user):** num_fbs=1 → the FB is overwritten while being scanned → **tearing**; plus the
+`rgb_swap=1 + byte_swap=1` color combo is unverified (may need a flip).
+
+**NEXT = increment 2 (target ~30 + clean image):** (1) drop the per-frame cache msync — skip `draw_overlays` in
+PPA mode so PPA reads the raw DMA-resident ISP frame (no CPU writes → no sync); (2) **non-blocking PPA** so the
+~20 ms op overlaps the next capture instead of stalling core 0; (3) **num_fbs=2 + page-flip** to kill tearing;
+(4) re-check the color combo. PPA is PSRAM-BW-bound (~2 MB/frame) so overlap (not raw speed) is the lever.
+Coexistence is no longer in question. `USE_PPA_DISPLAY 0` restores the keeper.
+
+---
+
 ## Test 014 — 2026-06-22 · YuNet+MBF display-off — completes the 2×2 matrix; best margins
 **Build:** same probe binary (`DISPLAY_PROBE_NO_FLUSH=1`). Switched to YuNet+MBF, cleared + re-enrolled 3.
 **Result: same display-bound story; YuNet+MBF is the best-accuracy combo.**
