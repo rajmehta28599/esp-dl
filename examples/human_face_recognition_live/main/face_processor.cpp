@@ -271,7 +271,12 @@ static bool g_pix_locked = true;
 // captures the range-crop -> tensor downscale: in Wide/Full the face shrinks in the tensor, landmarks
 // get coarse, alignment degrades and the genuine person false-rejects (TEST_LOG Test 002, esp.
 // YuNet+MFN). Gating small tensor-faces eliminates those false rejects (come closer / use Tight).
-#define Q_MIN_TENSOR_FACE_W 50
+// Task C: SEPARATE gates for enroll vs recognition. Enroll stays TIGHT (clean templates, ~arm's length);
+// recognition is LOOSER so it works out to ~1 m (a far face is noisier, but a genuine match still clears
+// the 0.62 threshold and a non-match simply isn't recognized). Do NOT lower the ENROLL gate — a far/blurry
+// enroll bakes bad landmarks into the template and poisons all future matching.
+#define Q_MIN_TENSOR_FACE_W_ENROLL 50 // enroll: ~arm's length (<=~600 mm) for clean templates
+#define Q_MIN_TENSOR_FACE_W_RECOG 30  // recognition: extends the operating range to ~1 m
 
 /* ---- Temporal voting before a punch -----------------------------------------
  * Require the same person to win K of the last M recognitions before firing a PUNCH. This
@@ -652,9 +657,10 @@ static face_quality_t score_face(const uint16_t *buf, int bw, int bh, const dl::
         }
     }
 
-    q.ok = q.width >= MIN_FACE_WIDTH && q.tensor_w >= Q_MIN_TENSOR_FACE_W &&
-           q.det_score >= Q_MIN_DET_SCORE && q.sharp >= Q_MIN_SHARP && q.frontal >= Q_MIN_FRONTAL &&
-           q.sat <= Q_MAX_SAT;
+    // tensor-face-width is NOT in q.ok — the caller applies it PER PATH (enroll = tight, recognition =
+    // loose; see Q_MIN_TENSOR_FACE_W_ENROLL/_RECOG). q.ok carries the path-independent quality checks.
+    q.ok = q.width >= MIN_FACE_WIDTH && q.det_score >= Q_MIN_DET_SCORE && q.sharp >= Q_MIN_SHARP &&
+           q.frontal >= Q_MIN_FRONTAL && q.sat <= Q_MAX_SAT;
     return q;
 }
 
@@ -1006,7 +1012,7 @@ static void ai_task(void *arg)
                 // Probe quality gate (cheap): skip blurry / oblique / blown probes so a bad frame
                 // cannot flip the decision. Only pay the feature extraction on a good frame.
                 face_quality_t pq = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
-                if (pq.ok) {
+                if (pq.ok && pq.tensor_w >= Q_MIN_TENSOR_FACE_W_RECOG) { // loose gate -> recognizes to ~1 m
                     int64_t rec0 = esp_timer_get_time();
                     std::vector<float> probe;
                     if (extract_feat(img, *largest_det, probe)) {
@@ -1064,10 +1070,11 @@ static void ai_task(void *arg)
         if (g_enroll_active) {
             if (det_ran && can_recognize && (now_us - g_enroll_last_cap_us > ENROLL_MIN_GAP_US)) {
                 face_quality_t q = score_face((const uint16_t *)g_ai_buf, aw, ah, *largest_det);
+                bool enroll_ok = q.ok && q.tensor_w >= Q_MIN_TENSOR_FACE_W_ENROLL; // tight: clean templates
                 // Calibration aid: grep "ENROLL," to see real quality numbers and tune the Q_* gates.
                 ESP_LOGI("ENROLL", "frame sharp=%.1f frontal=%.2f w=%d tw=%d sat=%.2f -> %s", q.sharp,
-                         q.frontal, q.width, q.tensor_w, q.sat, q.ok ? "keep" : "skip");
-                if (q.ok) {
+                         q.frontal, q.width, q.tensor_w, q.sat, enroll_ok ? "keep" : "skip");
+                if (enroll_ok) {
                     std::vector<float> feat;
                     if (extract_feat(img, *largest_det, feat)) {
                         // rank by combined quality (sharper + more frontal + larger = better)
