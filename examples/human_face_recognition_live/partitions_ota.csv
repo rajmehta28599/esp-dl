@@ -1,0 +1,15 @@
+# OTA partition layout for the PRODUCTION board (32 MB NOR flash).
+# Two app slots (ota_0 / ota_1) + otadata = the structural requirement for OTA. The current app is
+# ~8.5 MB, so each 10 MB slot leaves room to grow; "storage" (FAT) holds the face DB + punch records.
+#
+# Requires CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y. It does NOT fit a 16 MB chip (2 x 10 MB app slots alone =
+# 20 MB), which is exactly why OTA needs the 32 MB flash. Runtime OTA download also needs Wi-Fi (the C6),
+# which is a later phase; this table is the on-flash prerequisite.
+#
+# Name,     Type, SubType,  Offset,   Size,   Flags
+nvs,        data, nvs,      ,         24K,
+otadata,    data, ota,      ,         8K,
+phy_init,   data, phy,      ,         4K,
+ota_0,      app,  ota_0,    ,         10M,
+ota_1,      app,  ota_1,    ,         10M,
+storage,    data, fat,      ,         11M,

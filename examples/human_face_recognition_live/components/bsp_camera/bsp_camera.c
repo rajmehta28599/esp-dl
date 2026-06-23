@@ -270,6 +270,60 @@ esp_err_t video_stream_wait_stop(void)
     return ESP_OK;
 }
 
+// --- Camera control surface (V4L2 VIDIOC_S/G_EXT_CTRLS) ---
+// NOTE: the ISP+IPA run a continuous auto-exposure loop that rewrites the sensor every frame, so a
+// manual EXPOSURE/GAIN written here is overridden unless that loop is stopped. The SC2336 driver does
+// NOT implement 3A_LOCK or AE_LEVEL, so there is no clean RUNTIME lock/bias on this sensor — see the
+// camera_log_ctrl_support() output below for what is actually available on this hardware.
+esp_err_t camera_set_ctrl(uint32_t id, int32_t value)
+{
+    struct v4l2_ext_controls controls;
+    struct v4l2_ext_control control[1];
+    memset(&controls, 0, sizeof(controls));
+    memset(control, 0, sizeof(control));
+    controls.ctrl_class = V4L2_CTRL_CLASS_USER;
+    controls.count = 1;
+    controls.controls = control;
+    control[0].id = id;
+    control[0].value = value;
+    if (ioctl(camera_video_id, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+        CAMERA_ERROR("set ctrl 0x%08" PRIx32 " = %d failed (errno %d)", id, (int)value, errno);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+// Probe which exposure/WB controls the sensor+ISP actually expose (read-only); logged once at start so
+// we know what is tunable on THIS hardware instead of guessing from the driver source.
+void camera_log_ctrl_support(void)
+{
+    static const struct { uint32_t id; const char *name; } k[] = {
+        { V4L2_CID_EXPOSURE,          "EXPOSURE(lines)" },
+        { V4L2_CID_EXPOSURE_ABSOLUTE, "EXPOSURE_ABS(100us)" },
+        { V4L2_CID_GAIN,              "GAIN" },
+        { V4L2_CID_CAMERA_AE_LEVEL,   "AE_LEVEL(EV bias)" },
+        { V4L2_CID_3A_LOCK,           "3A_LOCK" },
+        { V4L2_CID_RED_BALANCE,       "RED_BALANCE" },
+        { V4L2_CID_BLUE_BALANCE,      "BLUE_BALANCE" },
+    };
+    CAMERA_INFO("--- camera control surface (what is tunable on this SC2336 + ISP) ---");
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        struct v4l2_ext_controls controls;
+        struct v4l2_ext_control control[1];
+        memset(&controls, 0, sizeof(controls));
+        memset(control, 0, sizeof(control));
+        controls.ctrl_class = V4L2_CTRL_CLASS_USER;
+        controls.count = 1;
+        controls.controls = control;
+        control[0].id = k[i].id;
+        if (ioctl(camera_video_id, VIDIOC_G_EXT_CTRLS, &controls) == 0) {
+            CAMERA_INFO("  %-22s SUPPORTED  current=%d", k[i].name, (int)control[0].value);
+        } else {
+            CAMERA_INFO("  %-22s not available (errno %d)", k[i].name, errno);
+        }
+    }
+}
+
 int camera_start(int core_id)
 {
     size_t cache_line_size = 0;
@@ -293,6 +347,7 @@ int camera_start(int core_id)
     if (video_stream_task_start(camera_video_id, core_id) != ESP_OK) {
         return -1;
     }
+    camera_log_ctrl_support(); // log what exposure/WB controls this hardware actually exposes
     return camera_video_id;
 }
 

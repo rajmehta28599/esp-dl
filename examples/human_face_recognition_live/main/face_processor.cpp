@@ -111,17 +111,15 @@ typedef struct {
     int yunet_w;  // YuNet input width (128/256/384/512); 0 for non-YuNet
 } det_model_cfg_t;
 static const det_model_cfg_t DET_MODELS[] = {
-    // Recognition-capable detectors (5 landmarks): MSRMNP + the 4 YuNet resolutions, kept adjacent so
-    // the DET button sweeps MSRMNP -> YuNet128 -> 256 -> 384 -> 512. ESPDet (detect-only) follows. Each
-    // YuNet resolution keeps its OWN per-name DB (persons_<REC>_YuNetNNN.bin) so enrollments at different
-    // resolutions don't confound the comparison.
+    // Recognition-capable detectors ONLY (all emit 5 landmarks): MSRMNP + the 4 YuNet resolutions. The DET
+    // button sweeps MSRMNP -> YuNet128 -> 256 -> 384 -> 512. ESPDet224/416 were removed — they are
+    // detection-only (no landmarks → cannot drive recognition); their model weights are also dropped from
+    // flash (CONFIG_FLASH_ESPDET_*=n in sdkconfig). Each YuNet resolution keeps its OWN per-name DB.
     {DET_KIND_HFD, HumanFaceDetect::MSRMNP_S8_V1, "MSRMNP", true, 0},
     {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet128", true, 128},
     {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet256", true, 256},
     {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet384", true, 384},
     {DET_KIND_YUNET, HumanFaceDetect::MSRMNP_S8_V1, "YuNet512", true, 512},
-    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_224_224_FACE, "ESPDet224", false, 0},
-    {DET_KIND_HFD, HumanFaceDetect::ESPDET_PICO_416_416_FACE, "ESPDet416", false, 0},
 };
 #define DET_MODEL_COUNT ((int)(sizeof(DET_MODELS) / sizeof(DET_MODELS[0])))
 
@@ -1035,11 +1033,19 @@ static void ai_task(void *arg)
                         // TAR/FAR proof + margin calibration: top-1, runner-up, and gap per frame.
                         // Grep "VERIFY," in monitor. Genuine should show a CLEAR gap to 2nd; an
                         // impostor/cross-match shows top-1 ~= 2nd (small margin -> now REJECTed).
-                        ESP_LOGI("VERIFY", "%s,id=%d,sim=%.4f,2nd=%d/%.4f,margin=%.4f,thr=%.2f,mgn=%.2f,%s,db=%d",
+                        // VERIFY also carries the probe quality covariates (B2) so the host analyzer
+                        // (tools/bench_accuracy.py) can attribute a REJECT to detect/align/recognize and
+                        // bin TAR/FAR by condition: tw=tensor-face-width(px, size/distance proxy),
+                        // fr=frontality 0..1, sh=sharpness(|Laplacian|), ds=detector score, sat=blown fraction.
+                        ESP_LOGI("VERIFY",
+                                 "%s,id=%d,sim=%.4f,2nd=%d/%.4f,margin=%.4f,thr=%.2f,mgn=%.2f,%s,db=%d,"
+                                 "tw=%d,fr=%.2f,sh=%.1f,ds=%.2f,sat=%.2f",
                                  g_stats.reco_model, g_reco_id, g_reco_sim, m.second_id, m.second_sim,
                                  (has_runner ? (double)margin : -1.0), (double)RECO_ACCEPT_THR,
                                  (double)RECO_MARGIN, g_reco_recognized ? "ACCEPT" : "REJECT",
-                                 g_persons.num_templates());
+                                 g_persons.num_templates(),
+                                 pq.tensor_w, (double)pq.frontal, (double)pq.sharp, (double)pq.det_score,
+                                 (double)pq.sat);
                     }
                 }
                 // else: poor probe quality -> leave rec_state at 2 (waiting) and keep sticky result.
@@ -1362,9 +1368,10 @@ esp_err_t face_processor_init(const char *db_path)
     ESP_LOGI("BENCH", "columns: detector,input,recognizer,featlen,range,fps,cap_ms,det_ms,rec_ms,"
                       "draw_ms,disp_ms,load0%%,load1%%,faces,db,int_free,psram_free,luma,sat%%,spoof");
     ESP_LOGI("VERIFY", "columns: recognizer,id,sim(raw cosine),2nd=runnerup_id/sim,margin(sim-2nd),"
-                       "accept_thr,margin_thr,decision,db_count | genuine=same enrolled person, "
-                       "impostor=different person; TAR=accepts/genuine, FAR=accepts/impostor. A genuine "
-                       "match shows a CLEAR margin to 2nd; cross-matches show sim~=2nd -> REJECT");
+                       "accept_thr,margin_thr,decision,db_count,tw=tensorfaceW,fr=frontal,sh=sharp,"
+                       "ds=detscore,sat=blownfrac | genuine=same enrolled person, impostor=different "
+                       "person; TAR=accepts/genuine, FAR=accepts/impostor. Feed the captured log to "
+                       "tools/bench_accuracy.py for TAR/FAR/EER/ROC + threshold sweep");
 
     detect_selftest();  // forces the (lazy) detector load so requery can read the input tensor
     requery_det_info(); // input resolution + name + keypoint capability

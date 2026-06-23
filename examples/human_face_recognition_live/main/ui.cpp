@@ -268,16 +268,22 @@ static void stats_timer_cb(lv_timer_t *timer)
 // ppa_display_pause() (which drains the in-flight blit so LVGL can own the whole FB) and hidden via
 // ppa_display_resume(). The R&D dashboard / thumbnail are deferred to a later increment.
 static lv_obj_t *s_ppa_status = nullptr;
+static lv_obj_t *s_ppa_fps = nullptr; // prominent live FPS readout in the band
 
 static void ppa_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     static pipeline_stats_t s;
     face_processor_get_stats(&s);
+    if (s_ppa_fps) {
+        static char fb[24];
+        snprintf(fb, sizeof(fb), "%.0f FPS", s.fps);
+        lv_label_set_text(s_ppa_fps, fb);
+    }
     if (s_ppa_status) {
         static char b[88];
-        snprintf(b, sizeof(b), "%s %dx%d   FPS %.0f   rec %.0f ms   DB %d", s.det_model, s.model_in_w,
-                 s.model_in_h, s.fps, s.rec_ms, s.db_count);
+        snprintf(b, sizeof(b), "%s %dx%d   rec %.0f ms   DB %d", s.det_model, s.model_in_w,
+                 s.model_in_h, s.rec_ms, s.db_count);
         lv_label_set_text(s_ppa_status, b);
     }
 
@@ -333,11 +339,18 @@ static void ui_init_ppa(void)
     snprintf(b, sizeof(b), "SPF:%s", face_processor_spoof_name());
     s_spoof_lbl = make_button(scr, b, LV_ALIGN_BOTTOM_LEFT, 436, -10, spoof_btn_cb);
 
+    // Prominent live FPS (band, right side) + a small detail line beneath it.
+    s_ppa_fps = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_ppa_fps, lv_color_hex(0x66ff66), 0);
+    lv_obj_set_style_text_font(s_ppa_fps, &lv_font_montserrat_24, 0);
+    lv_label_set_text(s_ppa_fps, "-- FPS");
+    lv_obj_align(s_ppa_fps, LV_ALIGN_BOTTOM_RIGHT, -8, -66);
+
     s_ppa_status = lv_label_create(scr);
     lv_obj_set_style_text_color(s_ppa_status, lv_color_white(), 0);
     lv_obj_set_style_text_font(s_ppa_status, &lv_font_montserrat_16, 0);
     lv_label_set_text(s_ppa_status, "starting...");
-    lv_obj_align(s_ppa_status, LV_ALIGN_BOTTOM_RIGHT, -8, -100);
+    lv_obj_align(s_ppa_status, LV_ALIGN_BOTTOM_RIGHT, -8, -14);
 
     // Punch card (text-only; centred over the camera). Shown via the pause handoff on a fresh match.
     s_punch_card = lv_obj_create(scr);

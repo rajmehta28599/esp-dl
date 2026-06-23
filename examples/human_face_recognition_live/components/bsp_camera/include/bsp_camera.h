@@ -96,6 +96,12 @@ esp_err_t video_stream_task_stop(int video_fd);
 esp_err_t video_stream_wait_stop(void);
 uint32_t app_video_get_buf_size(void);
 
+// Set one V4L2 sensor/ISP control (e.g. V4L2_CID_EXPOSURE / V4L2_CID_GAIN / V4L2_CID_RED_BALANCE).
+// Caveat: the ISP IPA auto-exposure loop overrides EXPOSURE/GAIN each frame on this SC2336.
+esp_err_t camera_set_ctrl(uint32_t id, int32_t value);
+// Log which exposure/WB controls this hardware actually exposes (+ current values). Called at start.
+void camera_log_ctrl_support(void);
+
 #ifdef __cplusplus
 }
 #endif

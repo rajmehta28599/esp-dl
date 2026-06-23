@@ -109,6 +109,8 @@ void ppa_display_blit(const uint8_t *cam_buf, uint32_t cam_w, uint32_t cam_h)
     srm.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
     srm.scale_x = 1.0f;
     srm.scale_y = 1.0f;
+    srm.mirror_x = true;  // mirror left-right (selfie/mirror preview) — FREE in PPA hardware (the old LVGL
+                          // path had to drop its ~20 ms/frame CPU mirror; PPA mirrors at zero cost)
     srm.rgb_swap = 0;  // Test 016: (byte_swap=0, rgb_swap=0) renders CORRECT color on the EK79007 FB
     srm.byte_swap = 0; // (also fixes the R/B swap the old LVGL path always had)
     srm.mode = PPA_TRANS_MODE_NON_BLOCKING;
